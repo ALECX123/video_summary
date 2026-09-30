@@ -4,7 +4,7 @@
 #include <QString>
 
 #include <thread>
-
+#include "ui_MainWindow.h"
 class QLabel;
 class QPushButton;
 class QTabWidget;

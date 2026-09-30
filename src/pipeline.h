@@ -10,6 +10,7 @@ struct PipelineOptions {
     std::filesystem::path ffmpeg;     // empty = auto-discover on PATH
     std::string language = "auto";    // "auto" = whisper auto-detect
     bool doSummary = true;
+    bool useGpu = true;                // false = whisper 强制走 CPU (cparams.use_gpu)
     std::string ollamaUrl = "http://127.0.0.1:11434";
     std::string ollamaModel = "qwen3:8b";
 };

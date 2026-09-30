@@ -257,6 +257,8 @@ PipelineResult runPipeline(const PipelineOptions& opt, const PipelineProgressFn&
     // --- whisper ---
     emit("正在加载模型: " + pathToUtf8(model));
     whisper_context_params cparams = whisper_context_default_params();
+    cparams.use_gpu = opt.useGpu;
+    emit(std::string("GPU 加速: ") + (opt.useGpu ? "开启" : "关闭 (CPU)"));
     WhisperCtx ctx;
     ctx.c = whisper_init_from_file_with_params(wideToAcp(model.wstring()).c_str(), cparams);
     if (!ctx.c) return fail(3, "错误: 模型加载失败: " + pathToUtf8(model));

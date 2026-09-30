@@ -7,8 +7,6 @@
 
 #include <QDir>
 #include <QFileDialog>
-#include <QGroupBox>
-#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -17,7 +15,6 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QStandardPaths>
-#include <QVBoxLayout>
 
 #include <filesystem>
 
@@ -31,81 +28,24 @@ constexpr auto kKeyDir = "download/outputDir";
 }  // namespace
 
 DownloadTab::DownloadTab(QWidget* parent) : QWidget(parent) {
-    auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(18, 18, 18, 18);
-    outer->setSpacing(12);
+    ui->setupUi(this);
 
-    // --- 视频链接 ---
-    QVBoxLayout* g1 = nullptr;
-    auto* urlGroup = vsum::makeGroup(tr("视频链接"), &g1, this);
-    urlEdit_ = new QLineEdit(urlGroup);
-    urlEdit_->setPlaceholderText(
-        tr("粘贴哔哩哔哩视频链接, 例如 https://www.bilibili.com/video/BV1EmaT6KEEh/"));
-    urlEdit_->setClearButtonEnabled(true);
-    urlHint_ = new QLabel(urlGroup);
-    vsum::setLabelRole(urlHint_, "hintLabel");
-    g1->addWidget(urlEdit_);
-    g1->addWidget(urlHint_);
-    outer->addWidget(urlGroup);
+    // --- 成员别名 (ui 对象名即 QSS 角色) ---
+    urlEdit_ = ui->urlEdit;
+    urlHint_ = ui->hintLabel;
+    dirEdit_ = ui->dirEdit;
+    dirRow_ = ui->dirRow;
+    bar_ = ui->progressBar;
+    stageLabel_ = ui->stageLabel;
+    errLabel_ = ui->errorLabel;
+    resultLabel_ = ui->resultLabel;
+    startBtn_ = ui->btnPrimary;
+    cancelBtn_ = ui->btnCancel;
+    openBtn_ = ui->btnQuiet;
 
-    // --- 保存位置 ---
-    QVBoxLayout* g2 = nullptr;
-    auto* dirGroup = vsum::makeGroup(tr("保存位置"), &g2, this);
-    dirEdit_ = new QLineEdit(dirGroup);
-    dirEdit_->setPlaceholderText(tr("选择视频文件的保存目录"));
-    dirRow_ = vsum::makePathRow(dirEdit_, tr("浏览…"), [this] { onBrowseDir(); }, dirGroup);
-    auto* dirNote = new QLabel(tr("文件名由稿件标题自动决定, 输出格式为 MP4。"), dirGroup);
-    vsum::setLabelRole(dirNote, "sectionHint");
-    g2->addWidget(dirRow_);
-    g2->addWidget(dirNote);
-    outer->addWidget(dirGroup);
-
-    // --- 操作按钮 ---
-    auto* actionRow = new QHBoxLayout;
-    actionRow->setSpacing(10);
-    startBtn_ = new QPushButton(tr("开始下载"), this);
-    startBtn_->setObjectName(QStringLiteral("btnPrimary"));
-    cancelBtn_ = new QPushButton(tr("取消"), this);
-    cancelBtn_->setObjectName(QStringLiteral("btnCancel"));
-    cancelBtn_->setEnabled(false);
-    cancelBtn_->setCursor(Qt::PointingHandCursor);
-    startBtn_->setCursor(Qt::PointingHandCursor);
-    actionRow->addWidget(startBtn_);
-    actionRow->addWidget(cancelBtn_);
-    actionRow->addStretch(1);
-    outer->addLayout(actionRow);
-
-    // --- 进度与结果 ---
-    QVBoxLayout* g3 = nullptr;
-    auto* progGroup = vsum::makeGroup(tr("下载进度"), &g3, this);
-    bar_ = new QProgressBar(progGroup);
-    bar_->setRange(0, 100);
-    bar_->setValue(0);
-    stageLabel_ = new QLabel(tr("就绪"), progGroup);
-    vsum::setLabelRole(stageLabel_, "stageLabel");
-    errLabel_ = new QLabel(progGroup);
-    vsum::setLabelRole(errLabel_, "errorLabel");
-    errLabel_->setWordWrap(true);
-    errLabel_->setVisible(false);
-
-    auto* resultRow = new QHBoxLayout;
-    resultRow->setSpacing(10);
-    resultLabel_ = new ElidedLabel(tr("尚未生成文件"), progGroup);
-    resultLabel_->setObjectName(QStringLiteral("resultLabel"));
-    openBtn_ = new QPushButton(tr("打开所在文件夹"), progGroup);
-    openBtn_->setObjectName(QStringLiteral("btnQuiet"));
-    openBtn_->setEnabled(false);
-    openBtn_->setCursor(Qt::PointingHandCursor);
-    resultRow->addWidget(resultLabel_, 1);
-    resultRow->addWidget(openBtn_, 0);
-
-    g3->addWidget(bar_);
-    g3->addWidget(stageLabel_);
-    g3->addWidget(errLabel_);
-    g3->addLayout(resultRow);
-    outer->addWidget(progGroup);
-
-    outer->addStretch(1);
+    // uic 通过 QLabel::setText 写入文本, 需同步 ElidedLabel 内部 full_,
+    // 否则 resize 后文本消失。
+    resultLabel_->setFullText(resultLabel_->text());
 
     // --- 信号 ---
     connect(urlEdit_, &QLineEdit::textChanged, this, &DownloadTab::onUrlChanged);
@@ -113,6 +53,7 @@ DownloadTab::DownloadTab(QWidget* parent) : QWidget(parent) {
     connect(startBtn_, &QPushButton::clicked, this, &DownloadTab::onStart);
     connect(cancelBtn_, &QPushButton::clicked, this, &DownloadTab::onCancel);
     connect(openBtn_, &QPushButton::clicked, this, &DownloadTab::onOpenFolder);
+    connect(ui->dirBrowseBtn, &QPushButton::clicked, this, &DownloadTab::onBrowseDir);
     connect(this, &DownloadTab::progressReady, this, &DownloadTab::onProgress,
             Qt::QueuedConnection);
     connect(this, &DownloadTab::downloadFinished, this, &DownloadTab::onFinished,
@@ -124,6 +65,7 @@ DownloadTab::DownloadTab(QWidget* parent) : QWidget(parent) {
 DownloadTab::~DownloadTab() {
     cancel_.store(true);
     if (worker_.joinable()) worker_.join();
+    delete ui;
 }
 
 // ---------------------------------------------------------------------------

@@ -5,13 +5,12 @@
 #include "Widgets.h"
 #include "pipeline.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
 #include <QGroupBox>
-#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -20,7 +19,6 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QSettings>
-#include <QVBoxLayout>
 
 #include <filesystem>
 
@@ -33,6 +31,7 @@ constexpr auto kKeyOutPrefix = "transcribe/outPrefix";
 constexpr auto kKeyModel = "transcribe/model";
 constexpr auto kKeyLanguage = "transcribe/language";
 constexpr auto kKeyFfmpeg = "transcribe/ffmpeg";
+constexpr auto kKeyUseGpu = "transcribe/useGpu";
 
 struct LangItem {
     const char* label;
@@ -48,123 +47,48 @@ const LangItem kLanguages[] = {
 }  // namespace
 
 TranscribeTab::TranscribeTab(QWidget* parent) : QWidget(parent) {
-    auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(18, 18, 18, 18);
-    outer->setSpacing(12);
+    ui->setupUi(this);
 
-    auto makeForm = [](QGroupBox* box) {
-        auto* form = new QFormLayout(box);
-        form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        form->setFormAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        form->setHorizontalSpacing(14);
-        form->setVerticalSpacing(10);
-        form->setContentsMargins(14, 14, 14, 12);
-        return form;
-    };
+    // --- 成员别名 (ui 对象名即 QSS 角色) ---
+    ioGroup_ = ui->ioGroup;
+    modelGroup_ = ui->modelGroup;
+    ffmpegGroup_ = ui->ffmpegGroup;
+    inputEdit_ = ui->inputEdit;
+    outPrefixEdit_ = ui->outPrefixEdit;
+    modelEdit_ = ui->modelEdit;
+    ffmpegEdit_ = ui->ffmpegEdit;
+    langCombo_ = ui->langCombo;
+    gpuCheck_ = ui->gpuCheck;
+    startBtn_ = ui->btnPrimary;
+    hintLabel_ = ui->hintLabel;
+    bar_ = ui->progressBar;
+    stageLabel_ = ui->stageLabel;
+    errLabel_ = ui->errorLabel;
+    warnLabel_ = ui->warnLabel;
+    log_ = ui->logView;
+    resultLabel_ = ui->resultLabel;
+    openBtn_ = ui->btnQuiet;
 
-    // --- 输入与输出 ---
-    ioGroup_ = new QGroupBox(tr("输入与输出"), this);
-    auto* ioForm = makeForm(ioGroup_);
-    inputEdit_ = new QLineEdit(ioGroup_);
-    inputEdit_->setPlaceholderText(tr("选择需要转写的视频或音频文件"));
-    QWidget* inputRow = vsum::makePathRow(
-        inputEdit_, tr("选择…"), [this] { onBrowseInput(); }, ioGroup_);
-    outPrefixEdit_ = new QLineEdit(ioGroup_);
-    outPrefixEdit_->setPlaceholderText(tr("默认与输入文件同目录同名 (不含扩展名)"));
-    ioForm->addRow(tr("输入文件:"), inputRow);
-    ioForm->addRow(tr("输出前缀:"), outPrefixEdit_);
-    outer->addWidget(ioGroup_);
+    // .ui 中 action 行的提示标签与进度区 warnLabel 不能同名, .ui 用 hintLabel,
+    // 这里补回原对象名 (QSS 角色)。
+    vsum::setLabelRole(hintLabel_, "warnLabel");
 
-    // --- 模型与语言 ---
-    modelGroup_ = new QGroupBox(tr("模型与语言"), this);
-    auto* modelForm = makeForm(modelGroup_);
-    modelEdit_ = new QLineEdit(modelGroup_);
-    modelEdit_->setPlaceholderText(tr("ggml 模型文件 (.bin)"));
-    QWidget* modelRow =
-        vsum::makePathRow(modelEdit_, tr("选择…"), [this] { onBrowseModel(); }, modelGroup_);
-    langCombo_ = new QComboBox(modelGroup_);
+    // uic 通过 QLabel::setText 写入文本, 需同步 ElidedLabel 内部 full_,
+    // 否则 resize 后文本消失。
+    resultLabel_->setFullText(resultLabel_->text());
+
+    // 语言项: 标签 + item data (.ui 留空, 由代码填充)。
     for (const LangItem& li : kLanguages) {
         langCombo_->addItem(QString::fromUtf8(li.label), QString::fromLatin1(li.code));
     }
-    modelForm->addRow(tr("模型文件:"), modelRow);
-    modelForm->addRow(tr("识别语言:"), langCombo_);
-    outer->addWidget(modelGroup_);
-
-    // --- ffmpeg ---
-    ffmpegGroup_ = new QGroupBox(tr("ffmpeg"), this);
-    auto* ffForm = makeForm(ffmpegGroup_);
-    ffmpegEdit_ = new QLineEdit(ffmpegGroup_);
-    ffmpegEdit_->setPlaceholderText(tr("留空则自动搜索 PATH (需要完整版 ffmpeg)"));
-    QWidget* ffRow =
-        vsum::makePathRow(ffmpegEdit_, tr("选择…"), [this] { onBrowseFfmpeg(); }, ffmpegGroup_);
-    ffForm->addRow(tr("ffmpeg 路径:"), ffRow);
-    auto* ffNote = new QLabel(
-        tr("项目目录里约 7MB 的裁剪版 ffmpeg 不可用, 请使用完整版。"), ffmpegGroup_);
-    vsum::setLabelRole(ffNote, "sectionHint");
-    ffForm->addRow(QString(), ffNote);
-    outer->addWidget(ffmpegGroup_);
-
-    // --- 操作按钮 ---
-    auto* actionRow = new QHBoxLayout;
-    actionRow->setSpacing(10);
-    startBtn_ = new QPushButton(tr("开始转写"), this);
-    startBtn_->setObjectName(QStringLiteral("btnPrimary"));
-    startBtn_->setCursor(Qt::PointingHandCursor);
-    hintLabel_ = new QLabel(this);
-    vsum::setLabelRole(hintLabel_, "warnLabel");
-    hintLabel_->setVisible(false);
-    actionRow->addWidget(startBtn_);
-    actionRow->addWidget(hintLabel_);
-    actionRow->addStretch(1);
-    outer->addLayout(actionRow);
-
-    // --- 进度与日志 ---
-    QVBoxLayout* g4 = nullptr;
-    auto* progGroup = vsum::makeGroup(tr("进度与日志"), &g4, this);
-    bar_ = new QProgressBar(progGroup);
-    bar_->setRange(0, 100);
-    bar_->setValue(0);
-    stageLabel_ = new QLabel(tr("就绪"), progGroup);
-    vsum::setLabelRole(stageLabel_, "stageLabel");
-    errLabel_ = new QLabel(progGroup);
-    vsum::setLabelRole(errLabel_, "errorLabel");
-    errLabel_->setWordWrap(true);
-    errLabel_->setVisible(false);
-    warnLabel_ = new QLabel(progGroup);
-    vsum::setLabelRole(warnLabel_, "warnLabel");
-    warnLabel_->setWordWrap(true);
-    warnLabel_->setVisible(false);
-
-    log_ = new QPlainTextEdit(progGroup);
-    log_->setObjectName(QStringLiteral("logView"));
-    log_->setReadOnly(true);
-    log_->setMaximumBlockCount(5000);
-    log_->setPlaceholderText(tr("转写日志会实时显示在这里…"));
-    log_->setMinimumHeight(150);
-
-    auto* resultRow = new QHBoxLayout;
-    resultRow->setSpacing(10);
-    resultLabel_ = new ElidedLabel(tr("尚未生成字幕文件"), progGroup);
-    resultLabel_->setObjectName(QStringLiteral("resultLabel"));
-    openBtn_ = new QPushButton(tr("打开所在文件夹"), progGroup);
-    openBtn_->setObjectName(QStringLiteral("btnQuiet"));
-    openBtn_->setEnabled(false);
-    openBtn_->setCursor(Qt::PointingHandCursor);
-    resultRow->addWidget(resultLabel_, 1);
-    resultRow->addWidget(openBtn_, 0);
-
-    g4->addWidget(bar_);
-    g4->addWidget(stageLabel_);
-    g4->addWidget(errLabel_);
-    g4->addWidget(warnLabel_);
-    g4->addWidget(log_, 1);
-    g4->addLayout(resultRow);
-    outer->addWidget(progGroup, 1);
 
     // --- 信号 ---
     connect(inputEdit_, &QLineEdit::textChanged, this, &TranscribeTab::onInputChanged);
     connect(startBtn_, &QPushButton::clicked, this, &TranscribeTab::onStart);
     connect(openBtn_, &QPushButton::clicked, this, &TranscribeTab::onOpenFolder);
+    connect(ui->inputBrowseBtn, &QPushButton::clicked, this, &TranscribeTab::onBrowseInput);
+    connect(ui->modelBrowseBtn, &QPushButton::clicked, this, &TranscribeTab::onBrowseModel);
+    connect(ui->ffmpegBrowseBtn, &QPushButton::clicked, this, &TranscribeTab::onBrowseFfmpeg);
     connect(this, &TranscribeTab::logReady, this, &TranscribeTab::onLogLine,
             Qt::QueuedConnection);
     connect(this, &TranscribeTab::runFinished, this, &TranscribeTab::onFinished,
@@ -175,6 +99,7 @@ TranscribeTab::TranscribeTab(QWidget* parent) : QWidget(parent) {
 
 TranscribeTab::~TranscribeTab() {
     if (worker_.joinable()) worker_.join();
+    delete ui;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +138,8 @@ void TranscribeTab::loadSettings() {
     if (ffmpeg.isEmpty()) ffmpeg = QString::fromStdWString(vsum::defaultFfmpegPath().wstring());
     ffmpegEdit_->setText(ffmpeg);
 
+    gpuCheck_->setChecked(s.value(kKeyUseGpu, true).toBool());
+
     if (outPrefixEdit_->text().trimmed().isEmpty()) deriveOutPrefix(inputEdit_->text());
 }
 
@@ -223,6 +150,7 @@ void TranscribeTab::saveSettings() {
     s.setValue(kKeyModel, modelEdit_->text().trimmed());
     s.setValue(kKeyLanguage, langCombo_->currentData().toString());
     s.setValue(kKeyFfmpeg, ffmpegEdit_->text().trimmed());
+    s.setValue(kKeyUseGpu, gpuCheck_->isChecked());
 }
 
 void TranscribeTab::deriveOutPrefix(const QString& input) {
@@ -316,6 +244,7 @@ void TranscribeTab::onStart() {
     po.model = fs::path(model.toStdWString());
     po.ffmpeg = fs::path(ffmpeg.toStdWString());
     po.language = langCombo_->currentData().toString().toStdString();
+    po.useGpu = gpuCheck_->isChecked();
     po.doSummary = false;  // ② 只负责字幕, 总结交给 ③
     po.ollamaUrl = "http://127.0.0.1:11434";
     po.ollamaModel = "qwen3:8b";

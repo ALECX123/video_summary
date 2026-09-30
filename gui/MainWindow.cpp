@@ -6,7 +6,6 @@
 #include "SummaryTab.h"
 #include "Theme.h"
 #include "TranscribeTab.h"
-#include "ui_MainWindow.h"
 
 #include <QCloseEvent>
 #include <QLabel>

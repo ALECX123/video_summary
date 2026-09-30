@@ -3,7 +3,7 @@
 #include <QWidget>
 
 #include <thread>
-
+#include "ui_SummaryTab.h"
 class QGroupBox;
 class QLabel;
 class QLineEdit;
@@ -13,6 +13,10 @@ class QPushButton;
 class QWidget;
 
 class ElidedLabel;
+
+namespace Ui {
+class SummaryTab;
+}
 
 // 标签 ③: 读取已有转写文件 (.srt/.txt) -> runSummaryOnly (后台线程)。
 // 与标签 ② 相同: 没有取消接口, 运行期间禁用「开始」并提示无法取消。
@@ -45,6 +49,8 @@ private:
     void loadSettings();
     void setBusy(bool busy);
     void deriveOutPath(const QString& transcript);
+
+    Ui::SummaryTab* ui = nullptr;
 
     QLineEdit* transcriptEdit_ = nullptr;
     QLineEdit* ollamaUrlEdit_ = nullptr;

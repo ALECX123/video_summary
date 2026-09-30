@@ -4,13 +4,17 @@
 
 #include <atomic>
 #include <thread>
-
+#include "ui_DownloadTab.h"
 class ElidedLabel;
 class QLabel;
 class QLineEdit;
 class QProgressBar;
 class QPushButton;
 class QWidget;
+
+namespace Ui {
+class DownloadTab;
+}
 
 // 标签 ①: 粘贴 B 站链接 -> bili::download (后台线程) -> mp4。
 // 取消按钮翻转 std::atomic<bool>, 由下载过程自行轮询。
@@ -42,6 +46,8 @@ private slots:
 private:
     void loadSettings();
     void setBusy(bool busy);
+
+    Ui::DownloadTab* ui = nullptr;
 
     QLineEdit* urlEdit_ = nullptr;
     QLabel* urlHint_ = nullptr;

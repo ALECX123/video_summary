@@ -8,9 +8,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
 #include <QGroupBox>
-#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -19,7 +17,6 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QSettings>
-#include <QVBoxLayout>
 
 #include <filesystem>
 #include <fstream>
@@ -42,123 +39,42 @@ constexpr auto kDefaultOllamaModel = "qwen3.5:latest";
 }  // namespace
 
 SummaryTab::SummaryTab(QWidget* parent) : QWidget(parent) {
-    auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(18, 18, 18, 18);
-    outer->setSpacing(12);
+    ui->setupUi(this);
 
-    auto makeForm = [](QGroupBox* box) {
-        auto* form = new QFormLayout(box);
-        form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        form->setFormAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        form->setHorizontalSpacing(14);
-        form->setVerticalSpacing(10);
-        form->setContentsMargins(14, 14, 14, 12);
-        return form;
-    };
+    // --- 成员别名 (ui 对象名即 QSS 角色) ---
+    srcGroup_ = ui->srcGroup;
+    ollamaGroup_ = ui->ollamaGroup;
+    outGroup_ = ui->outGroup;
+    transcriptEdit_ = ui->transcriptEdit;
+    ollamaUrlEdit_ = ui->ollamaUrlEdit;
+    ollamaModelEdit_ = ui->ollamaModelEdit;
+    outPathEdit_ = ui->outPathEdit;
+    startBtn_ = ui->btnPrimary;
+    hintLabel_ = ui->hintLabel;
+    bar_ = ui->progressBar;
+    stageLabel_ = ui->stageLabel;
+    errLabel_ = ui->errorLabel;
+    warnLabel_ = ui->warnLabel;
+    log_ = ui->logView;
+    resultLabel_ = ui->resultLabel;
+    openBtn_ = ui->btnQuiet;
+    preview_ = ui->previewView;
 
-    // --- 转写文件 ---
-    srcGroup_ = new QGroupBox(tr("转写文件"), this);
-    auto* srcForm = makeForm(srcGroup_);
-    transcriptEdit_ = new QLineEdit(srcGroup_);
-    transcriptEdit_->setPlaceholderText(tr("选择已有的字幕文件 (.srt) 或带时间戳的文本 (.txt)"));
-    QWidget* srcRow = vsum::makePathRow(
-        transcriptEdit_, tr("选择…"), [this] { onBrowseTranscript(); }, srcGroup_);
-    srcForm->addRow(tr("转写文件:"), srcRow);
-    auto* srcNote = new QLabel(tr("可直接使用标签 ② 生成的 .srt / .txt 文件。"), srcGroup_);
-    vsum::setLabelRole(srcNote, "sectionHint");
-    srcForm->addRow(QString(), srcNote);
-    outer->addWidget(srcGroup_);
-
-    // --- Ollama 设置 ---
-    ollamaGroup_ = new QGroupBox(tr("Ollama 设置"), this);
-    auto* olForm = makeForm(ollamaGroup_);
-    ollamaUrlEdit_ = new QLineEdit(ollamaGroup_);
-    ollamaUrlEdit_->setPlaceholderText(tr("例如 http://127.0.0.1:11434"));
-    ollamaModelEdit_ = new QLineEdit(ollamaGroup_);
-    ollamaModelEdit_->setPlaceholderText(tr("例如 qwen3.5:latest"));
-    olForm->addRow(tr("服务地址:"), ollamaUrlEdit_);
-    olForm->addRow(tr("模型名称:"), ollamaModelEdit_);
-    outer->addWidget(ollamaGroup_);
-
-    // --- 输出文件 ---
-    outGroup_ = new QGroupBox(tr("输出文件"), this);
-    auto* outForm = makeForm(outGroup_);
-    outPathEdit_ = new QLineEdit(outGroup_);
-    outPathEdit_->setPlaceholderText(tr("默认为转写文件同目录下的 <名称>.summary.md"));
-    QWidget* outRow =
-        vsum::makePathRow(outPathEdit_, tr("选择…"), [this] { onBrowseOutput(); }, outGroup_);
-    outForm->addRow(tr("输出文件:"), outRow);
-    outer->addWidget(outGroup_);
-
-    // --- 操作按钮 ---
-    auto* actionRow = new QHBoxLayout;
-    actionRow->setSpacing(10);
-    startBtn_ = new QPushButton(tr("开始总结"), this);
-    startBtn_->setObjectName(QStringLiteral("btnPrimary"));
-    startBtn_->setCursor(Qt::PointingHandCursor);
-    hintLabel_ = new QLabel(this);
+    // .ui 中 action 行的提示标签与进度区 warnLabel 不能同名, .ui 用 hintLabel,
+    // 这里补回原对象名 (QSS 角色)。
     vsum::setLabelRole(hintLabel_, "warnLabel");
-    hintLabel_->setVisible(false);
-    actionRow->addWidget(startBtn_);
-    actionRow->addWidget(hintLabel_);
-    actionRow->addStretch(1);
-    outer->addLayout(actionRow);
 
-    // --- 进度与日志 ---
-    QVBoxLayout* g4 = nullptr;
-    auto* progGroup = vsum::makeGroup(tr("进度与日志"), &g4, this);
-    bar_ = new QProgressBar(progGroup);
-    bar_->setRange(0, 100);
-    bar_->setValue(0);
-    stageLabel_ = new QLabel(tr("就绪"), progGroup);
-    vsum::setLabelRole(stageLabel_, "stageLabel");
-    errLabel_ = new QLabel(progGroup);
-    vsum::setLabelRole(errLabel_, "errorLabel");
-    errLabel_->setWordWrap(true);
-    errLabel_->setVisible(false);
-    warnLabel_ = new QLabel(progGroup);
-    vsum::setLabelRole(warnLabel_, "warnLabel");
-    warnLabel_->setWordWrap(true);
-    warnLabel_->setVisible(false);
-    log_ = new QPlainTextEdit(progGroup);
-    log_->setObjectName(QStringLiteral("logView"));
-    log_->setReadOnly(true);
-    log_->setMaximumBlockCount(5000);
-    log_->setPlaceholderText(tr("总结日志会实时显示在这里…"));
-    log_->setMinimumHeight(110);
-    g4->addWidget(bar_);
-    g4->addWidget(stageLabel_);
-    g4->addWidget(errLabel_);
-    g4->addWidget(warnLabel_);
-    g4->addWidget(log_, 1);
-    outer->addWidget(progGroup);
-
-    // --- 结果预览 ---
-    QVBoxLayout* g5 = nullptr;
-    auto* prevGroup = vsum::makeGroup(tr("总结预览"), &g5, this);
-    auto* prevRow = new QHBoxLayout;
-    prevRow->setSpacing(10);
-    resultLabel_ = new ElidedLabel(tr("尚未生成总结文件"), prevGroup);
-    resultLabel_->setObjectName(QStringLiteral("resultLabel"));
-    openBtn_ = new QPushButton(tr("打开所在文件夹"), prevGroup);
-    openBtn_->setObjectName(QStringLiteral("btnQuiet"));
-    openBtn_->setEnabled(false);
-    openBtn_->setCursor(Qt::PointingHandCursor);
-    prevRow->addWidget(resultLabel_, 1);
-    prevRow->addWidget(openBtn_, 0);
-    preview_ = new QPlainTextEdit(prevGroup);
-    preview_->setObjectName(QStringLiteral("previewView"));
-    preview_->setReadOnly(true);
-    preview_->setPlaceholderText(tr("生成成功后, summary.md 的内容会显示在这里。"));
-    preview_->setMinimumHeight(150);
-    g5->addLayout(prevRow);
-    g5->addWidget(preview_, 1);
-    outer->addWidget(prevGroup, 1);
+    // uic 通过 QLabel::setText 写入文本, 需同步 ElidedLabel 内部 full_,
+    // 否则 resize 后文本消失。
+    resultLabel_->setFullText(resultLabel_->text());
 
     // --- 信号 ---
     connect(transcriptEdit_, &QLineEdit::textChanged, this, &SummaryTab::onTranscriptChanged);
     connect(startBtn_, &QPushButton::clicked, this, &SummaryTab::onStart);
     connect(openBtn_, &QPushButton::clicked, this, &SummaryTab::onOpenFolder);
+    connect(ui->transcriptBrowseBtn, &QPushButton::clicked, this,
+            &SummaryTab::onBrowseTranscript);
+    connect(ui->outBrowseBtn, &QPushButton::clicked, this, &SummaryTab::onBrowseOutput);
     connect(this, &SummaryTab::logReady, this, &SummaryTab::onLogLine, Qt::QueuedConnection);
     connect(this, &SummaryTab::runFinished, this, &SummaryTab::onFinished,
             Qt::QueuedConnection);
@@ -168,6 +84,7 @@ SummaryTab::SummaryTab(QWidget* parent) : QWidget(parent) {
 
 SummaryTab::~SummaryTab() {
     if (worker_.joinable()) worker_.join();
+    delete ui;
 }
 
 // ---------------------------------------------------------------------------

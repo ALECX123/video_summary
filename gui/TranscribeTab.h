@@ -3,7 +3,8 @@
 #include <QWidget>
 
 #include <thread>
-
+#include "ui_TranscribeTab.h"
+class QCheckBox;
 class QComboBox;
 class QGroupBox;
 class QLabel;
@@ -14,6 +15,10 @@ class QPushButton;
 class QWidget;
 
 class ElidedLabel;
+
+namespace Ui {
+class TranscribeTab;
+}
 
 // 标签 ②: 选择媒体文件 -> runPipeline (后台线程, 仅转写, 不调用 Ollama)。
 // runPipeline 没有取消接口: 运行期间禁用「开始」并提示无法取消, 不做假取消。
@@ -47,11 +52,14 @@ private:
     void setBusy(bool busy);
     void deriveOutPrefix(const QString& input);
 
+    Ui::TranscribeTab* ui = nullptr;
+
     QLineEdit* inputEdit_ = nullptr;
     QLineEdit* outPrefixEdit_ = nullptr;
     QLineEdit* modelEdit_ = nullptr;
     QLineEdit* ffmpegEdit_ = nullptr;
     QComboBox* langCombo_ = nullptr;
+    QCheckBox* gpuCheck_ = nullptr;
 
     QGroupBox* ioGroup_ = nullptr;
     QGroupBox* modelGroup_ = nullptr;

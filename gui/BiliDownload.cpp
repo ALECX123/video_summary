@@ -31,9 +31,9 @@
 #include "QrCode.h"
 
 #include <windows.h>
-#include <shellapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -49,6 +49,7 @@
 #include <regex>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -112,12 +113,40 @@ std::string formattedDataSize(unsigned long long bytes)
     return buf;
 }
 
+// Combined "12.3/80.0 MB" formatter for the contract example
+// "下载视频流 12.3/80.0 MB" — ONE unit at the end (not "12.3 MB/80.0 MB").
+std::string formattedDataSizePair(unsigned long long done, unsigned long long total)
+{
+    constexpr unsigned long long Kilo = 1024ULL;
+    constexpr unsigned long long Mega = 1024ULL * 1024ULL;
+    constexpr unsigned long long Giga = 1024ULL * 1024ULL * 1024ULL;
+    char buf[96];
+    if (total > Giga) {
+        std::snprintf(buf, sizeof(buf), "%.2f/%.2f GB",
+                      static_cast<double>(done) / Giga, static_cast<double>(total) / Giga);
+    } else if (total > Mega) {
+        std::snprintf(buf, sizeof(buf), "%.1f/%.1f MB",
+                      static_cast<double>(done) / Mega, static_cast<double>(total) / Mega);
+    } else if (total > Kilo) {
+        std::snprintf(buf, sizeof(buf), "%.1f/%.1f KB",
+                      static_cast<double>(done) / Kilo, static_cast<double>(total) / Kilo);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%llu/%llu B",
+                      static_cast<unsigned long long>(done),
+                      static_cast<unsigned long long>(total));
+    }
+    return buf;
+}
+
 // Utils::legalizedFileName port: simplify whitespace, replace characters that
 // are illegal in Windows file names with their full-width look-alikes.
+// Reference bytes (verified against B23Downloader utils.cpp u'' literals):
+//   \ = U+FF3C (EF BC BC), / = U+FF0F, : = U+FF1A, * = U+FF0A, ? = U+FF1F,
+//   " = U+201C (E2 80 9C), < = U+FF1C, > = U+FF1E, | = U+FF5C (EF BD 9C)
 std::string legalizedFileName(std::string title)
 {
     static const struct { char from; const char* to; } kRepl[] = {
-        {'\\', "\xE5\xBC\x8B"},   // ＼  U+FF3C
+        {'\\', "\xEF\xBC\xBC"},   // ＼  U+FF3C
         {'/',  "\xEF\xBC\x8F"},   // ／  U+FF0F
         {':',  "\xEF\xBC\x9A"},   // ：  U+FF1A
         {'*',  "\xEF\xBC\x8A"},   // ＊  U+FF0A
@@ -125,7 +154,7 @@ std::string legalizedFileName(std::string title)
         {'"',  "\xE2\x80\x9C"},   // “  U+201C
         {'<',  "\xEF\xBC\x9C"},   // ＜  U+FF1C
         {'>',  "\xEF\xBC\x9E"},   // ＞  U+FF1E
-        {'|',  "\xEF\xBC\x9C"},   // placeholder, replaced below
+        {'|',  "\xEF\xBD\x9C"},   // ｜  U+FF5C
     };
     std::string out;
     out.reserve(title.size() + 8);
@@ -140,14 +169,12 @@ std::string legalizedFileName(std::string title)
         bool replaced = false;
         for (const auto& r : kRepl) {
             if (ch == r.from) {
-                if (r.from == '|') break;   // handled below with correct bytes
                 out += r.to;
                 replaced = true;
                 break;
             }
         }
         if (replaced) continue;
-        if (ch == '|') { out += "\xEF\xBC\x9C"; continue; } // overwritten below
         out.push_back(ch);
     }
     // Trim trailing space.
@@ -432,6 +459,7 @@ struct UrlParts {
 
 bool splitUrl(const std::string& url, UrlParts& out, std::string& err)
 {
+    // Groups: 1=scheme, 2=host, 3=port, 4=path, 5=query (no group 6).
     static const std::regex re(
         R"(^(https?):\/\/([^\/?#]+)(?::(\d+))?([^?#]*)(\?[^#]*)?(?:#.*)?$)");
     std::smatch m;
@@ -441,10 +469,10 @@ bool splitUrl(const std::string& url, UrlParts& out, std::string& err)
     }
     out.https = (m[1].str() == "https");
     out.host = m[2].str();
-    out.port = m[4].matched ? std::stoi(m[4].str()) : (out.https ? 443 : 80);
-    std::string path = m[5].matched ? m[5].str() : std::string();
+    out.port = m[3].matched ? std::stoi(m[3].str()) : (out.https ? 443 : 80);
+    std::string path = m[4].matched ? m[4].str() : std::string();
     if (path.empty()) path = "/";
-    std::string query = m[6].matched ? m[6].str() : std::string();
+    std::string query = m[5].matched ? m[5].str() : std::string();
     out.target = path + query;
     return true;
 }
@@ -551,7 +579,9 @@ httplib::Headers makeBiliHeaders(const std::string& cookie = std::string())
     return headers;
 }
 
-std::unique_ptr<httplib::ClientImpl> makeClient(const UrlParts& url)
+std::unique_ptr<httplib::ClientImpl> makeClient(const UrlParts& url,
+                                                int connTimeoutSec = 15,
+                                                int readTimeoutSec = 60)
 {
     std::unique_ptr<httplib::ClientImpl> client;
     if (url.https) {
@@ -559,8 +589,8 @@ std::unique_ptr<httplib::ClientImpl> makeClient(const UrlParts& url)
     } else {
         client = std::make_unique<httplib::ClientImpl>(url.host, url.port);
     }
-    client->set_connection_timeout(15, 0);
-    client->set_read_timeout(60, 0);
+    client->set_connection_timeout(connTimeoutSec, 0);
+    client->set_read_timeout(readTimeoutSec, 0);
     client->set_follow_location(false);   // redirects handled explicitly
     return client;
 }
@@ -585,9 +615,15 @@ std::string describeError(httplib::Error e)
 
 // Blocking GET; follows up to 5 redirects manually. Returns false on network
 // failure (err filled, Chinese). Never throws out.
+// cookiesOut (optional): every Set-Cookie header seen on any hop is appended
+// (QR login needs the Set-Cookie lines of the final poll response; Qt's cookie
+// jar in the reference merges them automatically, we must do it explicitly).
+// connTimeoutSec/readTimeoutSec allow short timeouts for QR polling.
 bool simpleGet(const std::string& url, const httplib::Headers& headers,
                long& statusOut, std::string& bodyOut, std::string& err,
-               bool requireJsonContentType)
+               bool requireJsonContentType,
+               std::vector<std::string>* cookiesOut = nullptr,
+               int connTimeoutSec = 15, int readTimeoutSec = 60)
 {
     statusOut = 0;
     bodyOut.clear();
@@ -596,13 +632,19 @@ bool simpleGet(const std::string& url, const httplib::Headers& headers,
         for (int hop = 0; hop <= 5; ++hop) {
             UrlParts parts;
             if (!splitUrl(current, parts, err)) return false;
-            auto client = makeClient(parts);
+            auto client = makeClient(parts, connTimeoutSec, readTimeoutSec);
             auto res = client->Get(parts.target, headers);
             if (!res) {
                 err = "网络请求错误: " + describeError(res.error());
                 return false;
             }
             statusOut = res->status;
+            if (cookiesOut != nullptr) {
+                size_t n = res->get_header_value_count("Set-Cookie");
+                for (size_t i = 0; i < n; ++i) {
+                    cookiesOut->push_back(res->get_header_value("Set-Cookie", "", i));
+                }
+            }
             if (statusOut >= 300 && statusOut < 400) {
                 std::string location = res->get_header_value("Location");
                 if (location.empty()) {
@@ -683,43 +725,32 @@ bool biliGetJson(const std::string& url, const std::string& requiredKey,
     return true;
 }
 
-// GET, but tolerate HTTP-level failure for short-link probing: on network
-// error returns false with err; callers handle.
+// Single-shot GET with redirects disabled; returns the RAW Location header.
+// Reference: Extractor::tryRedirect uses setMaximumRedirectsAllowed(0) and
+// reads the raw Location header (never follows).
 bool tryGetLocation(const std::string& url, long& statusOut, std::string& locationOut,
                     std::string& err)
 {
     statusOut = 0;
     locationOut.clear();
-    std::string current = url;
     try {
-        for (int hop = 0; hop <= 5; ++hop) {
-            UrlParts parts;
-            if (!splitUrl(current, parts, err)) return false;
-            auto client = makeClient(parts);
-            auto res = client->Get(parts.target, makeBiliHeaders());
-            if (!res) {
-                err = "网络请求错误: " + describeError(res.error());
-                return false;
-            }
-            statusOut = res->status;
-            if (statusOut >= 300 && statusOut < 400) {
-                std::string loc = res->get_header_value("Location");
-                if (loc.empty()) {
-                    err = "网络错误";
-                    return false;
-                }
-                current = resolveAgainst(current, loc);
-                continue;
-            }
-            return true;   // final non-redirect response; caller decides
+        UrlParts parts;
+        if (!splitUrl(url, parts, err)) return false;
+        auto client = makeClient(parts);
+        auto res = client->Get(parts.target, makeBiliHeaders());
+        if (!res) {
+            err = "网络错误";
+            return false;
         }
-        err = "网络请求错误: 重定向次数过多";
-        return false;
+        statusOut = res->status;
+        locationOut = res->get_header_value("Location");
+        err.clear();
+        return true;
     } catch (const std::exception& ex) {
-        err = std::string("网络请求错误: ") + ex.what();
+        err = std::string("网络错误: ") + ex.what();
         return false;
     } catch (...) {
-        err = "网络请求错误: 未知异常";
+        err = "网络错误: 未知异常";
         return false;
     }
 }
@@ -798,9 +829,9 @@ bool parseBiliUrl(const std::string& urlIn, InputTarget& out, long long& focusPa
         return false;
     }
     std::string host = lowerAscii(m[2].str());
-    std::string path = m[5].matched ? m[5].str() : std::string();
+    std::string path = m[4].matched ? m[4].str() : std::string();
     if (path.empty()) path = "/";
-    std::string query = m[6].matched ? m[6].str() : std::string();
+    std::string query = m[5].matched ? m[5].str() : std::string();
     focusPage = queryParamLongLong(query, "p");
 
     static const std::regex reHostBili(R"(^(?:www\.|m\.)?bilibili\.com$)");
@@ -831,6 +862,19 @@ bool parseBiliUrl(const std::string& urlIn, InputTarget& out, long long& focusPa
     err = "输入错误或不支持的链接";
     return false;
 }
+
+// ---------------------------------------------------------------------------
+// Internal resolve output: VideoInfo plus what fetchPlayUrl needs to pick the
+// right endpoint (UGC wbi playurl vs PGC playurl). PUGV/cheese links are not
+// parsed by parseBiliUrl, so playKind never becomes 2 (see report note).
+// ---------------------------------------------------------------------------
+struct ResolveResult {
+    VideoInfo info;
+    int playKind = 0;          // 0 = UGC (wbi playurl, key "data")
+                               // 1 = PGC (pgc playurl, key "result")
+    long long epId = 0;        // PGC only: episode id for pgc/player/web/playurl
+    long long seasonId = 0;    // PGC only: informational
+};
 
 // ---------------------------------------------------------------------------
 // View API (Extractor::startUgc / ugcFinished port)
@@ -899,9 +943,10 @@ bool resolveViewApi(const std::string& query, long long focusPage,
 }
 
 // PGC season (Extractor::startPgc / pgcFinished port, first episode only)
-bool resolvePgcSeason(long long seasonId, VideoInfo& info, std::string& err,
+bool resolvePgcSeason(long long seasonId, ResolveResult& rr, std::string& err,
                       const std::string& cookie)
 {
+    VideoInfo& info = rr.info;
     std::string url = "https://api.bilibili.com/pgc/view/web/season?season_id=" + numberToStr(seasonId);
     Json result;
     if (!biliGetJson(url, "result", result, err, cookie)) return false;
@@ -916,6 +961,10 @@ bool resolvePgcSeason(long long seasonId, VideoInfo& info, std::string& err,
         err = "请求错误: cid 为空";
         return false;
     }
+    const Json* epId = ep.find("id");
+    rr.playKind = 1;
+    rr.epId = epId ? epId->asInt(0) : 0;
+    rr.seasonId = seasonId;
     const Json* title = result.find("title");
     const Json* longTitle = ep.find("long_title");
     info.title = title ? title->asString() : std::string();
@@ -935,9 +984,10 @@ bool resolvePgcSeason(long long seasonId, VideoInfo& info, std::string& err,
     return true;
 }
 
-bool resolvePgcEpisode(long long epId, VideoInfo& info, std::string& err,
+bool resolvePgcEpisode(long long epId, ResolveResult& rr, std::string& err,
                        const std::string& cookie)
 {
+    VideoInfo& info = rr.info;
     std::string url = "https://api.bilibili.com/pgc/view/web/season?ep_id=" + numberToStr(epId);
     Json result;
     if (!biliGetJson(url, "result", result, err, cookie)) return false;
@@ -961,6 +1011,10 @@ bool resolvePgcEpisode(long long epId, VideoInfo& info, std::string& err,
         err = "请求错误: cid 为空";
         return false;
     }
+    rr.playKind = 1;
+    rr.epId = epId;
+    const Json* seasonIdPtr = result.find("season_id");
+    rr.seasonId = seasonIdPtr ? seasonIdPtr->asInt(0) : 0;
     const Json* seasonTitle = result.find("title");
     info.title = seasonTitle ? seasonTitle->asString() : std::string();
     const Json* longTitle = ep.find("long_title");
@@ -987,23 +1041,25 @@ bool followShortLink(const std::string& url, std::string& nextUrl, std::string& 
 {
     long status = 0;
     std::string location;
-    if (!tryGetLocation(url, status, location, err)) return false;
+    if (!tryGetLocation(url, status, location, err)) return false;   // err = 网络错误
     if (location.empty()) {
-        err = "网络错误";
+        // Reference: reply succeeded but no Location header -> 未知错误
+        err = "未知错误";
         return false;
     }
     if (location.find("bilibili.com") == std::string::npos) {
         err = "重定向目标非B站";
         return false;
     }
-    nextUrl = location;
+    nextUrl = resolveAgainst(url, location);
     return true;
 }
 
 // Full resolve pipeline for a single input string.
-bool resolveInner(const std::string& rawInput, VideoInfo& info, std::string& err,
+bool resolveInner(const std::string& rawInput, ResolveResult& rr, std::string& err,
                   const ProgressFn& progress, std::atomic<bool>* cancel)
 {
+    VideoInfo& info = rr.info;
     std::string input = trimmed(rawInput);
     if (input.empty()) {
         err = "输入为空";
@@ -1075,9 +1131,9 @@ bool resolveInner(const std::string& rawInput, VideoInfo& info, std::string& err
             return true;
         }
         case InputTarget::Kind::PgcSeason:
-            return resolvePgcSeason(target.id, info, err, cookie);
+            return resolvePgcSeason(target.id, rr, err, cookie);
         case InputTarget::Kind::PgcEpisode:
-            return resolvePgcEpisode(target.id, info, err, cookie);
+            return resolvePgcEpisode(target.id, rr, err, cookie);
         case InputTarget::Kind::Unsupported: {
             // short link: follow redirect then re-dispatch
             std::string next;
@@ -1104,11 +1160,28 @@ struct StreamUrl {
 // Video quality ladder desc (VideoDownloadTask::videoQnDescMap order)
 const int kVideoQnLadder[] = {127, 126, 125, 120, 116, 112, 80, 74, 64, 32, 16};
 
-bool fetchPlayUrl(long long aid, long long cid, Json& data, std::string& err,
+// Pick the playurl endpoint from the ResolveResult:
+//   playKind 0 (UGC)  -> x/player/wbi/playurl (key "data")
+//   playKind 1 (PGC)  -> pgc/player/web/playurl?ep_id=.. (key "result")
+//     DEVIATION vs reference: reference sends "?ep_id=&qn=&fourk=1" (no fnval);
+//     we add &fnver=0&fnval=80 so the response carries a DASH manifest, which
+//     the rest of this module (pickVideoStream/pickAudioStream) requires.
+//   PUGV/cheese inputs are rejected by parseBiliUrl, so no playKind 2.
+bool fetchPlayUrl(const ResolveResult& rr, Json& data, std::string& err,
                   const std::string& cookie)
 {
-    std::string api = "https://api.bilibili.com/x/player/wbi/playurl?avid=" + numberToStr(aid) +
-                      "&cid=" + numberToStr(cid) +
+    if (rr.playKind == 1) {
+        if (rr.epId == 0) {
+            err = "请求错误: epId 为空";
+            return false;
+        }
+        std::string api = "https://api.bilibili.com/pgc/player/web/playurl?ep_id=" +
+                          numberToStr(rr.epId) +
+                          "&qn=127&fnver=0&fnval=80&fourk=1";
+        return biliGetJson(api, "result", data, err, cookie);
+    }
+    std::string api = "https://api.bilibili.com/x/player/wbi/playurl?avid=" + numberToStr(rr.info.aid) +
+                      "&cid=" + numberToStr(rr.info.cid) +
                       "&qn=127&fnver=0&fnval=80&fourk=1";
     return biliGetJson(api, "data", data, err, cookie);
 }
@@ -1155,14 +1228,13 @@ bool pickVideoStream(const Json& data, int currentQn, StreamUrl& out, std::strin
         return false;
     }
 
-    // First pass: exact id match with non-HEVC codec (reference behaviour).
-    std::vector<int> availableIds;
+    // First pass: exact id match with non-HEVC codec (reference behaviour:
+    // HEVC/codecid 12 entries are excluded when the list is built).
     for (const auto& v : video->arr) {
         const Json* codec = v.find("codecid");
         long long codecId = codec ? codec->asInt(0) : 0;
         const Json* id = v.find("id");
         if (id == nullptr) continue;
-        availableIds.push_back(static_cast<int>(id->asInt(0)));
         if (static_cast<int>(id->asInt(0)) == currentQn && codecId != 12) {
             std::string ext;
             collectStream(v, out, ext);
@@ -1192,10 +1264,13 @@ bool pickVideoStream(const Json& data, int currentQn, StreamUrl& out, std::strin
             }
         }
     }
-    // Third pass (all codecs, if nothing else): any id <= currentQn, else ladder walk.
+    // Third pass: ladder walk, still skipping HEVC (codecid 12) — the
+    // reference excludes HEVC at list-build time, so every pass must too.
     for (int rung : kVideoQnLadder) {
         if (rung > currentQn) continue;
         for (const auto& v : video->arr) {
+            const Json* codec = v.find("codecid");
+            if (codec != nullptr && codec->asInt(0) == 12) continue;
             const Json* id = v.find("id");
             if (id != nullptr && static_cast<int>(id->asInt(0)) == rung) {
                 std::string ext;
@@ -1205,11 +1280,13 @@ bool pickVideoStream(const Json& data, int currentQn, StreamUrl& out, std::strin
             }
         }
     }
-    if (!availableIds.empty()) {
-        // last resort: first entry
+    // Last resort: first non-HEVC entry with a URL; HEVC-only -> url empty.
+    for (const auto& v : video->arr) {
+        const Json* codec = v.find("codecid");
+        if (codec != nullptr && codec->asInt(0) == 12) continue;
         std::string ext;
         out = StreamUrl();
-        collectStream(video->arr.front(), out, ext);
+        collectStream(v, out, ext);
         if (!out.primary.empty()) { err.clear(); return true; }
     }
     err = "url empty";
@@ -1235,9 +1312,10 @@ bool pickAudioStream(const Json& data, int currentQn, StreamUrl& out, std::strin
             if (!out.primary.empty()) { err.clear(); return true; }
         }
     }
-    // Best available not exceeding wanted (audio ladder 30216 < 30232 < 30280 < 30250...)
-    // quality numeric order for audio: 30216, 30232, 30280, 30250, 30251
-    static const int kAudioLadder[] = {30216, 30232, 30280, 30250, 30251};
+    // Best available not exceeding wanted. Reference ladder (DownloadTask.cpp):
+    // 30216=64K, 30232=132K, 30280=192K, 30250=Dolby, 30251=Hi-Res.
+    // Exact id == currentQn+30200 already failed above, so take the largest
+    // id <= wanted numerically.
     int best = -1;
     for (const auto& a : audio->arr) {
         const Json* id = a.find("id");
@@ -1266,180 +1344,220 @@ bool pickAudioStream(const Json& data, int currentQn, StreamUrl& out, std::strin
 }
 
 // ---------------------------------------------------------------------------
-// Stream download with progress + cancellation
+// Stream download (worker side).
+// Contract: ProgressFn is called from the CALLING thread only, so the worker
+// never invokes it; it updates StreamCounters and the calling thread polls.
 // ---------------------------------------------------------------------------
-struct StreamDownloadContext {
-    std::ofstream file;
-    unsigned long long received = 0;
-    unsigned long long total = 0;
-    bool canceled = false;
-    bool writeFailed = false;
-    int status = 0;
-    std::atomic<bool>* cancelFlag = nullptr;
-    ProgressFn progress;
-    // shared totals across both streams
-    unsigned long long* doneCounter = nullptr;
-    unsigned long long* totalCounter = nullptr;
+struct StreamCounters {
+    std::atomic<unsigned long long> done{0};
+    std::atomic<unsigned long long> total{0};   // 0 = unknown (no Content-Length)
 };
 
-void reportProgress(const ProgressFn& progress, unsigned long long done,
-                    unsigned long long total, const char* stage = "下载视频流")
+// Combine both streams' counters into the contract's stage format:
+//   "下载视频流 12.3/80.0 MB" (one unit at the end), fraction -1 while any
+//   total is unknown.
+void reportCombinedProgress(const StreamCounters& video, const StreamCounters& audio,
+                            const ProgressFn& progress)
 {
     if (!progress) return;
-    std::string text = std::string(stage) + " " + formattedDataSize(done);
+    unsigned long long d = video.done.load() + audio.done.load();
+    unsigned long long tv = video.total.load();
+    unsigned long long ta = audio.total.load();
+    std::string stage;
     double fraction = -1.0;
-    if (total > 0) {
-        text += "/" + formattedDataSize(total);
-        fraction = static_cast<double>(done) / static_cast<double>(total);
+    if (tv > 0 && ta > 0) {
+        unsigned long long t = tv + ta;
+        stage = "下载视频流 " + formattedDataSizePair(d, t);
+        fraction = static_cast<double>(d) / static_cast<double>(t);
         if (fraction > 1.0) fraction = 1.0;
+    } else {
+        stage = "下载视频流 " + formattedDataSize(d);
     }
-    try { progress(text, fraction); } catch (...) {}
+    try { progress(stage, fraction); } catch (...) {}
 }
 
-// Download one URL to path. Returns:
-//   0 ok, 1 canceled, 2 error (err filled)
+// Per-request attempt state (single worker thread per stream).
+struct AttemptState {
+    unsigned long long received = 0;
+    long status = 0;
+    std::string location;
+    bool redirected = false;
+    bool canceled = false;
+    bool siblingAborted = false;
+    bool writeFailed = false;
+};
+
+// Download one URL to path (tries primary, then backup URLs, up to 5 redirect
+// hops each). Returns: 0 ok, 1 canceled, 2 error (err filled).
+// When this stream fails (rc 2) *streamAbort is set so the sibling stream
+// stops early; an aborted sibling returns rc 2 with EMPTY err.
 int downloadOneStream(const StreamUrl& stream, const std::filesystem::path& path,
-                      std::atomic<bool>* cancel, const ProgressFn& progress,
-                      unsigned long long& sharedDone, unsigned long long& sharedTotal,
-                      bool knownTotal, std::string& err)
+                      std::atomic<bool>* cancel, std::atomic<bool>* streamAbort,
+                      StreamCounters& counters, std::string& err)
 {
     std::vector<std::string> urls;
     if (!stream.primary.empty()) urls.push_back(stream.primary);
     for (const auto& b : stream.backups) urls.push_back(b);
     if (urls.empty()) {
         err = "url empty";
+        streamAbort->store(true);
         return 2;
     }
 
     for (size_t attempt = 0; attempt < urls.size(); ++attempt) {
-        const std::string& url = urls[attempt];
-        UrlParts parts;
-        if (!splitUrl(url, parts, err)) return 2;
+        std::string current = urls[attempt];
+        const unsigned long long baseDone = counters.done.load();
+        const unsigned long long baseTotal = counters.total.load();
 
-        StreamDownloadContext ctx;
-        ctx.cancelFlag = cancel;
-        ctx.file.open(path, std::ios::binary | std::ios::trunc | std::ios::out);
-        if (!ctx.file.is_open()) {
-            err = "打开文件失败";
-            return 2;
-        }
+        int finalRc = -1;          // -1 = still deciding inside the hop loop
+        std::string finalErr;
+        bool retryNextUrl = false; // failure worth retrying with a backup URL
 
-        bool networkError = false;
-        std::string netErr;
-        try {
-            auto client = makeClient(parts);
-            auto res = client->Get(
-                parts.target, makeBiliHeaders(cookieSnapshot()),
-                // response handler: capture status + total, allow redirects
-                [&](const httplib::Response& resp) -> bool {
-                    ctx.status = resp.status;
-                    if (ctx.status >= 300 && ctx.status < 400) {
-                        return true;   // let body through; handled below
-                    }
-                    std::string cl = resp.get_header_value("Content-Length");
-                    if (!cl.empty()) {
-                        try {
-                            unsigned long long t = std::stoull(cl);
-                            if (t > 0) {
-                                ctx.total = t;
-                                if (knownTotal) sharedTotal += t;
-                            }
-                        } catch (...) {}
-                    }
-                    if (ctx.total == 0 || !knownTotal) {
-                        if (progress && ctx.total > 0) {
-                            reportProgress(progress, sharedDone, sharedTotal);
-                        }
-                    }
-                    if (ctx.status != 200) {
-                        return false;   // stop consuming an error body
-                    }
-                    return true;
-                },
-                // content receiver: write + progress + cancel
-                [&](const char* data, size_t len) -> bool {
-                    if (cancel != nullptr && cancel->load()) {
-                        ctx.canceled = true;
-                        return false;
-                    }
-                    if (len > 0) {
-                        ctx.file.write(data, static_cast<std::streamsize>(len));
-                        if (!ctx.file.good()) {
-                            ctx.writeFailed = true;
-                            return false;
-                        }
-                        ctx.received += len;
-                        sharedDone += len;
-                    }
-                    if (progress) {
-                        reportProgress(progress, sharedDone, sharedTotal);
-                    }
-                    return true;
-                });
-
-            ctx.file.close();
-
-            if (ctx.canceled) {
-                err = "已取消";
-                return 1;
-            }
-            if (ctx.writeFailed) {
-                err = "文件写入失败";
+        for (int hop = 0; hop <= 5 && finalRc < 0; ++hop) {
+            UrlParts parts;
+            if (!splitUrl(current, parts, err)) {
+                streamAbort->store(true);
                 return 2;
             }
-            if (!res) {
-                // receiver aborted with non-cancel reason (e.g. non-200 status)
-                if (ctx.status != 200 && ctx.status != 0) {
-                    err = "HTTP请求错误: 状态码 " + numberToStr(ctx.status);
-                    netErr = err;
-                } else {
-                    netErr = "网络请求错误: " + describeError(res.error());
-                    err = netErr;
-                }
-                networkError = true;
-            } else if (ctx.status >= 300 && ctx.status < 400) {
-                netErr = "网络请求错误: 重定向未被处理";
-                err = netErr;
-                networkError = true;
-            } else if (res->status != 200 && ctx.status == 200) {
-                ctx.status = res->status;
-                err = "HTTP请求错误: 状态码 " + numberToStr(ctx.status);
-                netErr = err;
-                networkError = true;
-            } else {
-                // success
-                if (ctx.received == 0) {
-                    netErr = "网络请求错误: 空响应";
-                    err = netErr;
-                    networkError = true;
-                } else {
-                    err.clear();
-                    return 0;
-                }
+
+            // Fresh truncated file per hop: redirect hops never write a byte.
+            std::ofstream file(path, std::ios::binary | std::ios::trunc | std::ios::out);
+            if (!file.is_open()) {
+                err = "打开文件失败";
+                streamAbort->store(true);
+                return 2;
             }
-        } catch (const std::exception& ex) {
-            ctx.file.close();
-            err = std::string("网络请求错误: ") + ex.what();
-            return 2;
-        } catch (...) {
-            ctx.file.close();
-            err = "网络请求错误: 未知异常";
-            return 2;
+
+            AttemptState st;
+            try {
+                auto client = makeClient(parts);
+                auto res = client->Get(
+                    parts.target, makeBiliHeaders(cookieSnapshot()),
+                    // response handler: capture status / Location / total.
+                    // Returning false aborts the body (no httplib redirect
+                    // following — set_follow_location(false)).
+                    [&](const httplib::Response& resp) -> bool {
+                        st.status = resp.status;
+                        if (st.status >= 300 && st.status < 400) {
+                            st.location = resp.get_header_value("Location");
+                            st.redirected = !st.location.empty();
+                            return false;
+                        }
+                        if (st.status != 200) return false;
+                        std::string cl = resp.get_header_value("Content-Length");
+                        if (!cl.empty()) {
+                            try {
+                                unsigned long long t = std::stoull(cl);
+                                if (t > 0) {
+                                    counters.total.store(t);
+                                }
+                            } catch (...) {}
+                        }
+                        return true;
+                    },
+                    // content receiver: write + counters + cancel/sibling abort
+                    [&](const char* data, size_t len) -> bool {
+                        if (cancel != nullptr && cancel->load()) {
+                            st.canceled = true;
+                            return false;
+                        }
+                        if (streamAbort->load()) {
+                            st.siblingAborted = true;
+                            return false;
+                        }
+                        if (len > 0) {
+                            file.write(data, static_cast<std::streamsize>(len));
+                            if (!file.good()) {
+                                st.writeFailed = true;
+                                return false;
+                            }
+                            st.received += len;
+                            counters.done.fetch_add(len);
+                        }
+                        return true;
+                    });
+                file.close();
+
+                if (st.redirected) {
+                    // Media CDN redirect: follow manually (<=5 hops).
+                    current = resolveAgainst(current, st.location);
+                    continue;
+                }
+                if (st.canceled) {
+                    finalRc = 1;
+                    finalErr = "已取消";
+                } else if (st.siblingAborted) {
+                    finalRc = 2;
+                    finalErr.clear();       // sibling carries the real message
+                } else if (st.writeFailed) {
+                    finalRc = 2;
+                    finalErr = "文件写入失败";
+                    streamAbort->store(true);
+                } else if (!res) {
+                    if (st.status >= 300 && st.status < 400) {
+                        finalRc = 2;
+                        finalErr = "网络请求错误: 重定向缺少 Location";
+                    } else if (st.status != 200 && st.status != 0) {
+                        finalRc = 2;
+                        finalErr = "HTTP请求错误: 状态码 " + numberToStr(st.status);
+                    } else {
+                        finalRc = 2;
+                        finalErr = "网络请求错误: " + describeError(res.error());
+                    }
+                    retryNextUrl = true;
+                } else if (res->status != 200) {
+                    finalRc = 2;
+                    finalErr = "HTTP请求错误: 状态码 " + numberToStr(res->status);
+                    retryNextUrl = true;
+                } else if (st.received == 0) {
+                    finalRc = 2;
+                    finalErr = "网络请求错误: 空响应";
+                    retryNextUrl = true;
+                } else {
+                    finalRc = 0;
+                    finalErr.clear();
+                }
+            } catch (const std::exception& ex) {
+                file.close();
+                finalRc = 2;
+                finalErr = std::string("网络请求错误: ") + ex.what();
+                retryNextUrl = true;
+            } catch (...) {
+                file.close();
+                finalRc = 2;
+                finalErr = "网络请求错误: 未知异常";
+                retryNextUrl = true;
+            }
         }
 
-        // rollback shared counters for this attempt before trying next URL
-        if (networkError && ctx.received > 0) {
-            sharedDone -= std::min(sharedDone, ctx.received);
-            if (knownTotal && ctx.total > 0) {
-                sharedTotal -= std::min(sharedTotal, ctx.total);
-            }
+        if (finalRc < 0) {
+            // hop budget exhausted without a decision
+            finalRc = 2;
+            finalErr = "网络请求错误: 重定向次数过多";
+            retryNextUrl = true;
         }
-        // remove partial file before retry
+        if (finalRc == 0) {
+            err.clear();
+            return 0;
+        }
+        if (!retryNextUrl) {
+            // terminal (cancel / sibling abort / file error)
+            err = finalErr;
+            return finalRc;
+        }
+
+        // Roll back this attempt's contribution, then try the backup URL.
+        counters.done.store(baseDone);
+        if (counters.total.load() != baseTotal) {
+            counters.total.store(baseTotal);
+        }
+        err = finalErr;
         std::error_code ec;
         std::filesystem::remove(path, ec);
-        (void)ec;
     }
+
     if (err.empty()) err = "网络请求错误";
+    streamAbort->store(true);
     return 2;
 }
 
@@ -1474,7 +1592,7 @@ std::filesystem::path findOnPath(const std::wstring& exeName)
     DWORD needed = GetEnvironmentVariableW(L"PATH", nullptr, 0);
     if (needed == 0) return {};
     std::vector<wchar_t> buf(needed, L'\0');
-    DWORD got = GetEnvironmentVariableW(L"PATH", buf.data(), needed, nullptr);
+    DWORD got = GetEnvironmentVariableW(L"PATH", buf.data(), needed);
     if (got == 0 || got >= needed) return {};
     std::wstring path(buf.data(), got);
 
@@ -1485,15 +1603,22 @@ std::filesystem::path findOnPath(const std::wstring& exeName)
     size_t pos = 0;
     while (pos <= path.size()) {
         size_t semi = path.find(L';', pos);
-        std::wstring dir = (semi == std::wstring::npos)
-                               ? path.substr(pos)
-                               : path.substr(pos, semi - pos);
+        std::wstring dirW = (semi == std::wstring::npos)
+                                ? path.substr(pos)
+                                : path.substr(pos, semi - pos);
         pos = (semi == std::wstring::npos) ? path.size() + 1 : semi + 1;
-        dir = trimmed(narrow(dir));   // trim via narrow then re-widen (ASCII paths)
-        if (dir.empty()) continue;
-        std::wstring wdir = widen(dir);
+        // Trim (ASCII) + strip surrounding quotes, then back to wide.
+        std::string dir8 = trimmed(narrow(dirW));
+        if (dir8.size() >= 2 && dir8.front() == '"' && dir8.back() == '"') {
+            dir8 = dir8.substr(1, dir8.size() - 2);
+            dir8 = trimmed(dir8);
+        }
+        if (dir8.empty()) continue;
+        std::wstring wdir = widen(dir8);
+        while (!wdir.empty() && (wdir.back() == L'\\' || wdir.back() == L'/')) wdir.pop_back();
+        if (wdir.empty()) continue;
         // skip current directory entries (project convention: never pick ./ffmpeg.exe)
-        if (!curDirStr.empty() && wdir == curDirStr) continue;
+        if (!curDirStr.empty() && _wcsicmp(wdir.c_str(), curDirStr.c_str()) == 0) continue;
         std::wstring candidate = wdir + L"\\" + exeName;
         DWORD attrs = GetFileAttributesW(candidate.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -1563,7 +1688,7 @@ bool runFfmpegMerge(const std::filesystem::path& ffmpegExe,
 
     BOOL ok = CreateProcessW(ffmpegExe.wstring().c_str(), mutableCmd.data(), nullptr, nullptr,
                              TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    if (hNul != INVALID_FILE_ATTRIBUTES && hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
     CloseHandle(hLog);
     if (!ok) {
         err = "启动 ffmpeg 失败 (错误码 " + std::to_string(GetLastError()) + ")";
@@ -1626,7 +1751,7 @@ bool looksLikeBiliUrl(const std::string& input)
     std::smatch m;
     if (!std::regex_match(url, m, re)) return false;
     std::string host = lowerAscii(m[2].str());
-    std::string path = m[5].matched ? m[5].str() : std::string();
+    std::string path = m[4].matched ? m[4].str() : std::string();
     if (path.empty()) path = "/";
 
     static const std::regex reHostBili(R"(^(?:www\.|m\.)?bilibili\.com$)");
@@ -1648,7 +1773,10 @@ bool resolve(const std::string& url, VideoInfo& info, std::string& err,
     info = VideoInfo{};
     err.clear();
     try {
-        return resolveInner(url, info, err, progress, cancel);
+        ResolveResult rr;
+        if (!resolveInner(url, rr, err, progress, cancel)) return false;
+        info = std::move(rr.info);
+        return true;
     } catch (const std::exception& ex) {
         err = std::string("发生错误: ") + ex.what();
         return false;
@@ -1671,7 +1799,6 @@ bool download(const std::string& url, const std::filesystem::path& outDir,
         err = message;
         return false;
     };
-    (void)fail;
 
     auto canceled = [&]() {
         return cancel != nullptr && cancel->load();
@@ -1693,27 +1820,29 @@ bool download(const std::string& url, const std::filesystem::path& outDir,
 
         // ---- resolve ----
         reportStage("解析链接", -1.0);
-        VideoInfo resolved;
+        ResolveResult resolved;
         if (!resolveInner(url, resolved, err, progress, cancel)) {
             return false;
         }
-        info = resolved;
+        info = resolved.info;
         if (canceled()) return fail("已取消", 0);
 
         // ---- playurl (DASH) ----
         reportStage("获取播放地址", -1.0);
         std::string cookie = cookieSnapshot();
         Json data;
-        if (!fetchPlayUrl(info.aid, info.cid, data, err, cookie)) {
+        if (!fetchPlayUrl(resolved, data, err, cookie)) {
             return false;
         }
         if (canceled()) return fail("已取消", 0);
 
-        // is_preview / has_paid gate (jsonValue2Bool semantics from reference)
+        // is_preview / has_paid gate (jsonValue2Bool semantics from reference:
+        // missing has_paid defaults to TRUE -> allowed; only an explicit false
+        // blocks the download).
         const Json* isPreview = data.find("is_preview");
         if (isPreview != nullptr && isPreview->asBool(false)) {
             const Json* hasPaid = data.find("has_paid");
-            if (hasPaid == nullptr || !hasPaid->asBool(true)) {
+            if (hasPaid != nullptr && !hasPaid->asBool(true)) {
                 return fail("该视频需要大会员/付费", 0);
             }
         }
@@ -1753,39 +1882,71 @@ bool download(const std::string& url, const std::filesystem::path& outDir,
             std::filesystem::remove(p, ec);
         };
 
-        // ---- download video then audio ----
-        unsigned long long done = 0;
-        unsigned long long total = 0;
+        // ---- download video + audio SIMULTANEOUSLY (reference behaviour:
+        // two parallel transfers; combined fraction is monotonic because both
+        // totals are known from the two response handlers). Progress is
+        // reported ONLY from this (calling) thread per the contract. ----
+        StreamCounters videoCounters;
+        StreamCounters audioCounters;
+        std::atomic<bool> streamAbort{false};
+        int rcVideo = -1;
+        int rcAudio = -1;
+        std::string errVideo;
+        std::string errAudio;
+        std::atomic<bool> videoDone{false};
+        std::atomic<bool> audioDone{false};
 
-        // video stream: known total once response arrives
+        std::thread videoThread([&] {
+            rcVideo = downloadOneStream(videoStream, videoTemp, cancel, &streamAbort,
+                                        videoCounters, errVideo);
+            videoDone.store(true);
+        });
+        std::thread audioThread([&] {
+            rcAudio = downloadOneStream(audioStream, audioTemp, cancel, &streamAbort,
+                                        audioCounters, errAudio);
+            audioDone.store(true);
+        });
+
         reportStage("下载视频流", -1.0);
-        int rc = downloadOneStream(videoStream, videoTemp, cancel, progress, done, total, true,
-                                   err);
-        if (rc == 1) {
-            removeQuiet(videoTemp);
-            removeQuiet(audioTemp);
-            return false;   // err already "已取消"
+        while (!videoDone.load() || !audioDone.load()) {
+            if (canceled()) {
+                // Workers observe the cancel flag on their next chunk; keep
+                // polling until both exit so we never touch files mid-write.
+            }
+            reportCombinedProgress(videoCounters, audioCounters, progress);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        if (rc != 0) {
-            removeQuiet(videoTemp);
-            removeQuiet(audioTemp);
-            return false;
-        }
-        if (canceled()) {
-            removeQuiet(videoTemp);
-            removeQuiet(audioTemp);
-            return fail("已取消", 0);
-        }
+        videoThread.join();
+        audioThread.join();
+        reportCombinedProgress(videoCounters, audioCounters, progress);
 
-        rc = downloadOneStream(audioStream, audioTemp, cancel, progress, done, total, true, err);
-        if (rc == 1 || rc != 0) {
+        // rc merge: error (2) wins, then cancel (1).
+        auto cleanupTemps = [&] {
             removeQuiet(videoTemp);
             removeQuiet(audioTemp);
+        };
+        if (rcVideo == 2 && !errVideo.empty()) {
+            cleanupTemps();
+            err = errVideo;
+            return false;
+        }
+        if (rcAudio == 2 && !errAudio.empty()) {
+            cleanupTemps();
+            err = errAudio;
+            return false;
+        }
+        if (rcVideo == 2 || rcAudio == 2) {
+            cleanupTemps();
+            err = "网络请求错误";
+            return false;
+        }
+        if (rcVideo == 1 || rcAudio == 1) {
+            cleanupTemps();
+            err = "已取消";
             return false;
         }
         if (canceled()) {
-            removeQuiet(videoTemp);
-            removeQuiet(audioTemp);
+            cleanupTemps();
             return fail("已取消", 0);
         }
 
@@ -1875,9 +2036,13 @@ QrPoll qrPoll(const std::string& qrKey, std::string& err)
     try {
         long status = 0;
         std::string body;
+        std::vector<std::string> setCookies;
         std::string url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=" +
                           qrKey;
-        if (!simpleGet(url, makeBiliHeaders(cookieSnapshot()), status, body, err, true)) {
+        // Short timeouts: the GUI polls on a ~2s timer; a hung poll must not
+        // block the UI thread for the default 60s read timeout.
+        if (!simpleGet(url, makeBiliHeaders(cookieSnapshot()), status, body, err, true,
+                       &setCookies, 5, 15)) {
             return QrPoll::Error;
         }
         if (status != 200) {
@@ -1903,16 +2068,22 @@ QrPoll qrPoll(const std::string& qrKey, std::string& err)
         }
         long long code = codePtr->asInt(0);
         if (code == 0) {
-            // Success: capture ALL Set-Cookie headers, merge into jar.
-            int headerCount = 0;
-            // simpleGet didn't return headers; re-request headers via raw client:
-            // (handled below by a dedicated fetch)
-            (void)headerCount;
-            // NOTE: simpleGet consumed the response; do the capture in a second
-            // call only when code==0 would lose cookies. Instead, re-run with a
-            // header-capturing variant:
+            // Success: merge ALL Set-Cookie headers from this response into the
+            // jar (SESSDATA / bili_jct / DedeUserID ...), one lock, then done.
+            if (!setCookies.empty()) {
+                std::lock_guard<std::mutex> lock(g_cookieMutex);
+                auto jar = parseCookiePairs(g_cookie);
+                for (const auto& sc : setCookies) mergeSetCookieLine(sc, jar);
+                std::string out;
+                for (size_t i = 0; i < jar.size(); ++i) {
+                    if (i) out += "; ";
+                    out += jar[i].first;
+                    out += '=';
+                    out += jar[i].second;
+                }
+                g_cookie = out;
+            }
             err.clear();
-            // The cookie capture is performed by qrPollCapture (see below).
             return QrPoll::Success;
         }
         if (code == 86101) return QrPoll::Waiting;
@@ -1948,12 +2119,29 @@ bool navLoginState(bool& loggedIn, std::string& uname, std::string& err)
         }
         Json root;
         if (!parseJsonText(body, root, err)) return false;
+        const Json* codePtr = root.find("code");
+        long long code = codePtr ? codePtr->asInt(0) : 0;
+        if (code == -101) {
+            // Not logged in (anonymous). NOT an error per contract:
+            // "loggedIn=false with err=='' is NOT an error".
+            loggedIn = false;
+            uname.clear();
+            err.clear();
+            return true;
+        }
+        if (code < 0) {
+            const Json* msg = root.find("message");
+            if (msg == nullptr || msg->type != Json::Type::String) msg = root.find("msg");
+            if (msg != nullptr && msg->type == Json::Type::String && !msg->strVal.empty()) {
+                err = msg->strVal;
+            } else {
+                err = "B站请求错误: code = " + numberToStr(code);
+            }
+            return false;
+        }
         const Json* data = root.find("data");
         if (data == nullptr || !data->isObject()) {
-            const Json* msg = root.find("message");
-            err = (msg != nullptr && msg->type == Json::Type::String && !msg->strVal.empty())
-                      ? msg->strVal
-                      : "请求错误: 内容为空";
+            err = "请求错误: 内容为空";
             return false;
         }
         const Json* isLogin = data->find("isLogin");

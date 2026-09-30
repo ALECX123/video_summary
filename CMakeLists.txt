@@ -57,6 +57,11 @@ endif()
 # --- gui sources (glob so they may appear at any time) ---
 file(GLOB VSUM_GUI_CPP CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/gui/*.cpp")
 file(GLOB VSUM_GUI_HDR CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/gui/*.h")
+file(GLOB VSUM_GUI_UI CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/gui/*.ui")
+# BiliDownload.cpp is compiled into bili_core (with CPPHTTPLIB_OPENSSL_SUPPORT);
+# keep it out of the executable's own sources to avoid double compilation.
+list(FILTER VSUM_GUI_CPP EXCLUDE REGEX "BiliDownload\\.cpp$")
+list(FILTER VSUM_GUI_HDR EXCLUDE REGEX "BiliDownload\\.h$")
 if(VSUM_GUI_CPP)
     set(VSUM_GUI_ENABLED ON)
     message(STATUS "video_summary: gui sources = ENABLED (${VSUM_GUI_CPP})")
@@ -177,10 +182,11 @@ elseif(NOT VSUM_GUI_CPP)
 endif()
 
 if(VSUM_GUI_SKIP STREQUAL "")
-    add_executable(video_summary_gui ${VSUM_GUI_CPP} ${VSUM_GUI_HDR})
+    add_executable(video_summary_gui ${VSUM_GUI_CPP} ${VSUM_GUI_HDR} ${VSUM_GUI_UI})
 
     set_target_properties(video_summary_gui PROPERTIES
         AUTOMOC ON                 # per-target; CMAKE_AUTOMOC stays off globally
+        AUTOUIC ON                 # #include "ui_xxx.h" -> gui/xxx.ui via uic
         WIN32_EXECUTABLE TRUE
     )
 

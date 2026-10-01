@@ -288,6 +288,9 @@ void MessageTab::pollOnce() {
 				if (seen_.size() >= 4096) seen_.clear();  // 去重集合封顶
 				seen_.insert(key);
 				enqueue(Job{session.talkerId, link});
+				emit logReady(QStringLiteral("%1 发来消息: %2")
+					.arg(session.talkerId)
+					.arg(textPreview(m)));
 				emit logReady(QStringLiteral("收到 %1 的视频链接: %2")
 					.arg(session.talkerId)
 					.arg(QString::fromUtf8(link)));

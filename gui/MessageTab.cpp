@@ -248,23 +248,17 @@ void MessageTab::pollOnce() {
 	for (const bili::PmSession& session : sessions) {
 		if (stop_) return;
 		const auto it = seqno_.find(session.talkerId);
-		if (it == seqno_.end()) {
-			// 只给有未读的会话记基线: 本次不取消息, 刻意跳过已有历史。
-			if (session.unread > 0) {
-				seqno_[session.talkerId] = session.maxSeqno;
-				// 未读会话被刻意跳过: 读完后补设已读, 失败仅去重记日志, 不中断轮询。
-				if (!bili::markPmRead(session.talkerId, session.maxSeqno, ackErr)) {
-					const QString q = QString::fromUtf8(ackErr);
-					if (q != lastAckErr_) { emit logReady(QStringLiteral("设置已读失败: %1").arg(q)); lastAckErr_ = q; }
-				} else {
-					lastAckErr_.clear();
-				}
-			}
-			continue;
+
+		// 只给有未读的会话记基线: 本次不取消息, 刻意跳过已有历史。
+		if (session.unread > 0) {
+			seqno_[session.talkerId] = session.ackSeqno;
+			emit logReady(QStringLiteral("获取 %1 未读消息: %2")
+				.arg(session.talkerId)
+				.arg(session.ackSeqno));
 		}
 
 		std::vector<bili::PmMessage> msgs;
-		if (!bili::fetchPmMessages(session.talkerId, it->second, 50, msgs, err)) {
+		if (!bili::fetchPmMessages(session.talkerId, it->second, 20, msgs, err)) {
 			emit logReady(QStringLiteral("获取 %1 的私信失败: %2")
 				.arg(session.talkerId)
 				.arg(QString::fromUtf8(err)));
@@ -275,6 +269,9 @@ void MessageTab::pollOnce() {
 		bool advanced = false;  // 本会话基线是否推进过 (推进过才需设已读)
 		for (auto rit = msgs.rbegin(); rit != msgs.rend(); ++rit) {
 			const bili::PmMessage& m = *rit;
+			emit logReady(QStringLiteral("%1 发来消息: %2")
+					.arg(session.talkerId)
+					.arg(textPreview(m)));
 			if (m.seqno <= seqno_[session.talkerId]) continue;
 			seqno_[session.talkerId] = m.seqno;
 			advanced = true;
@@ -288,16 +285,13 @@ void MessageTab::pollOnce() {
 				if (seen_.size() >= 4096) seen_.clear();  // 去重集合封顶
 				seen_.insert(key);
 				enqueue(Job{session.talkerId, link});
-				emit logReady(QStringLiteral("%1 发来消息: %2")
-					.arg(session.talkerId)
-					.arg(textPreview(m)));
 				emit logReady(QStringLiteral("收到 %1 的视频链接: %2")
 					.arg(session.talkerId)
 					.arg(QString::fromUtf8(link)));
 			}
 			else {
 				// 所有非链接的收到消息都上屏 (文本给正文预览, 其它类型给原始内容预览)。
-				emit logReady(QStringLiteral("%1 发来消息: %2")
+				emit logReady(QStringLiteral("%1 未解析发来消息: %2")
 					.arg(session.talkerId)
 					.arg(textPreview(m)));
 			}
@@ -309,6 +303,7 @@ void MessageTab::pollOnce() {
 				const QString q = QString::fromUtf8(ackErr);
 				if (q != lastAckErr_) { emit logReady(QStringLiteral("设置已读失败: %1").arg(q)); lastAckErr_ = q; }
 			} else {
+				emit logReady(QStringLiteral("设置已读: %1").arg(session.talkerId));
 				lastAckErr_.clear();
 			}
 		}

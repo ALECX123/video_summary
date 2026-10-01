@@ -48,7 +48,7 @@ C++17 命令行工具：输入视频或音频，自动抽取音轨、转写成�
 >
 > 项目目录里那个约 7MB 的 `ffmpeg.exe` 是 `--disable-everything` 裁剪构建，**没有 AAC 解码器、不能输出 WAV**，无法用于抽音轨。
 >
-> 必须使用完整版 ffmpeg，或用 `--ffmpeg <完整版路径>` 显式指定（本机可用 `F:\Code\LOLClip\bin\ffmpeg-4.1\ffmpeg.exe`）。
+> 必须使用完整版 ffmpeg，或用 `--ffmpeg <完整版路径>` 显式指定（本机可用 `F:\bin\ffmpeg-4.1\ffmpeg.exe`）。
 >
 > 程序从 PATH 查找 ffmpeg（**会跳过当前目录**）。找不到且输入不是 `.wav` 时直接退出，退出码 2。
 

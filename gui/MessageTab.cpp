@@ -80,7 +80,7 @@ namespace {
 }  // namespace
 
 MessageTab::MessageTab(QWidget* parent) : QWidget(parent),
-	ui(new Ui::MessageTab)
+ui(new Ui::MessageTab)
 {
 	ui->setupUi(this);
 
@@ -164,7 +164,7 @@ void MessageTab::onToggleEnabled(bool checked) {
 		std::string err;
 		const bool ok = bili::myMid(mid, err);
 		emit verifyFinished(ok, QString::fromUtf8(err), static_cast<qint64>(mid));
-	});
+		});
 }
 
 void MessageTab::onVerifyFinished(bool ok, const QString& err, qint64 mid) {
@@ -228,7 +228,7 @@ void MessageTab::pollTick() {
 	pollThread_ = std::thread([this] {
 		pollOnce();
 		pollBusy_.store(false);
-	});
+		});
 }
 
 void MessageTab::pollOnce() {
@@ -248,13 +248,19 @@ void MessageTab::pollOnce() {
 	for (const bili::PmSession& session : sessions) {
 		if (stop_) return;
 		const auto it = seqno_.find(session.talkerId);
-
-		// 只给有未读的会话记基线: 本次不取消息, 刻意跳过已有历史。
-		if (session.unread > 0) {
-			seqno_[session.talkerId] = session.ackSeqno;
-			emit logReady(QStringLiteral("获取 %1 未读消息: %2")
-				.arg(session.talkerId)
-				.arg(session.ackSeqno));
+		if (it == seqno_.end())
+		{
+			// 只给有未读的会话记基线: 本次不取消息, 刻意跳过已有历史。
+			if (session.unread > 0) {
+				seqno_[session.talkerId] = session.ackSeqno;
+				emit logReady(QStringLiteral("获取 %1 未读消息: %2")
+					.arg(session.talkerId)
+					.arg(session.ackSeqno));
+			}
+			else
+			{
+				continue;
+			}
 		}
 
 		std::vector<bili::PmMessage> msgs;
@@ -270,8 +276,8 @@ void MessageTab::pollOnce() {
 		for (auto rit = msgs.rbegin(); rit != msgs.rend(); ++rit) {
 			const bili::PmMessage& m = *rit;
 			emit logReady(QStringLiteral("%1 发来消息: %2")
-					.arg(session.talkerId)
-					.arg(textPreview(m)));
+				.arg(session.talkerId)
+				.arg(textPreview(m)));
 			if (m.seqno <= seqno_[session.talkerId]) continue;
 			seqno_[session.talkerId] = m.seqno;
 			advanced = true;
@@ -284,7 +290,7 @@ void MessageTab::pollOnce() {
 				if (seen_.count(key) != 0) continue;
 				if (seen_.size() >= 4096) seen_.clear();  // 去重集合封顶
 				seen_.insert(key);
-				enqueue(Job{session.talkerId, link});
+				enqueue(Job{ session.talkerId, link });
 				emit logReady(QStringLiteral("收到 %1 的视频链接: %2")
 					.arg(session.talkerId)
 					.arg(QString::fromUtf8(link)));
@@ -302,7 +308,8 @@ void MessageTab::pollOnce() {
 			if (!bili::markPmRead(session.talkerId, seqno_[session.talkerId], ackErr)) {
 				const QString q = QString::fromUtf8(ackErr);
 				if (q != lastAckErr_) { emit logReady(QStringLiteral("设置已读失败: %1").arg(q)); lastAckErr_ = q; }
-			} else {
+			}
+			else {
 				emit logReady(QStringLiteral("设置已读: %1").arg(session.talkerId));
 				lastAckErr_.clear();
 			}
@@ -448,7 +455,8 @@ void MessageTab::failJob(const Job& job, const QString& title, const QString& re
 		emit logReady(QStringLiteral("已回发失败通知 %1: %2")
 			.arg(job.talkerId)
 			.arg(contentPreview(QString::fromUtf8(msg))));
-	} else {
+	}
+	else {
 		emit logReady(QStringLiteral("失败通知回发 %1 也失败: %2")
 			.arg(job.talkerId)
 			.arg(QString::fromUtf8(sendErr)));

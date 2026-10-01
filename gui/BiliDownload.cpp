@@ -2740,41 +2740,59 @@ bool sendPmText(long long receiverUid, const std::string& text, std::string& err
         std::string mixinKey;
         if (!wbiMixinKeyCached(mixinKey, err)) return false;
         std::string devId = devIdOnce();
-        long long now = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-        // Byte-truncate to the 2000-byte limit BEFORE jsonEscape (never
-        // shrink after escaping — that could split an escape sequence).
-        std::string clipped = utf8Truncate(text, 2000);
-        // Signed set = URL query {w_sender_uid, w_receiver_id, w_dev_id, wts}
-        // only; the msg[...] body is NOT part of the signature.
-        std::vector<std::pair<std::string, std::string>> signParams = {
-            {"w_sender_uid", numberToStr(sender)},
-            {"w_receiver_id", numberToStr(receiverUid)},
-            {"w_dev_id", devId},
-            {"wts", numberToStr(now)},
-        };
-        std::string query = wbiSignQuery(std::move(signParams), mixinKey);
-        std::vector<std::pair<std::string, std::string>> form = {
-            {"msg[sender_uid]", numberToStr(sender)},
-            {"msg[receiver_id]", numberToStr(receiverUid)},
-            {"msg[receiver_type]", "1"},
-            {"msg[msg_type]", "1"},
-            {"msg[msg_status]", "0"},
-            {"msg[dev_id]", devId},
-            {"msg[timestamp]", numberToStr(now)},
-            {"msg[new_face_version]", "1"},
-            {"msg[content]", "{\"content\":\"" + jsonEscape(clipped) + "\"}"},
-            {"csrf", csrf},
-            {"csrf_token", csrf},
-            {"build", "0"},
-            {"mobi_app", "web"},
-        };
-        std::string url =
-            "https://api.vc.bilibili.com/web_im/v1/web_im/send_msg?" + query;
-        Json root;
-        if (!biliPostFormJson(url, formEncode(form), "", root, err, cookie)) {
-            return false;
+        // 每批 ≤1500 字节分批发出 (content 上限 2000 字节, 留出 JSON 转义
+        // 与包装余量); 任一批失败立即停止, 已发出的批次无法回滚。
+        constexpr size_t kChunkBytes = 1500;
+        std::string remaining = text;
+        bool first = true;
+        for (;;) {
+            if (!first) {
+                // 批次间短暂间隔, 降低连续发送触发风控的概率。
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+            first = false;
+            // Byte-truncate to the chunk limit BEFORE jsonEscape (never
+            // shrink after escaping — that could split an escape sequence).
+            std::string clipped = utf8Truncate(remaining, kChunkBytes);
+            if (clipped.empty() && !remaining.empty()) {
+                err = "发生错误: 消息分批遇到非法 UTF-8";
+                return false;
+            }
+            long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            // Signed set = URL query {w_sender_uid, w_receiver_id, w_dev_id, wts}
+            // only; the msg[...] body is NOT part of the signature.
+            std::vector<std::pair<std::string, std::string>> signParams = {
+                {"w_sender_uid", numberToStr(sender)},
+                {"w_receiver_id", numberToStr(receiverUid)},
+                {"w_dev_id", devId},
+                {"wts", numberToStr(now)},
+            };
+            std::string query = wbiSignQuery(std::move(signParams), mixinKey);
+            std::vector<std::pair<std::string, std::string>> form = {
+                {"msg[sender_uid]", numberToStr(sender)},
+                {"msg[receiver_id]", numberToStr(receiverUid)},
+                {"msg[receiver_type]", "1"},
+                {"msg[msg_type]", "1"},
+                {"msg[msg_status]", "0"},
+                {"msg[dev_id]", devId},
+                {"msg[timestamp]", numberToStr(now)},
+                {"msg[new_face_version]", "1"},
+                {"msg[content]", "{\"content\":\"" + jsonEscape(clipped) + "\"}"},
+                {"csrf", csrf},
+                {"csrf_token", csrf},
+                {"build", "0"},
+                {"mobi_app", "web"},
+            };
+            std::string url =
+                "https://api.vc.bilibili.com/web_im/v1/web_im/send_msg?" + query;
+            Json root;
+            if (!biliPostFormJson(url, formEncode(form), "", root, err, cookie)) {
+                return false;
+            }
+            if (clipped.size() >= remaining.size()) break;
+            remaining.erase(0, clipped.size());
         }
         // Success: the server marks the target session read automatically
         // (发送私信 doc note) — no extra update_ack needed here.

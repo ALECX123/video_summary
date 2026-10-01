@@ -46,6 +46,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <system_error>
@@ -723,6 +724,370 @@ bool biliGetJson(const std::string& url, const std::string& requiredKey,
     }
     err.clear();
     return true;
+}
+
+// ===========================================================================
+// Private-message helpers (私信, message/private_msg.md)
+// ===========================================================================
+
+// encodeURIComponent-style percent encoding: unreserved =
+// A-Za-z0-9 - _ . ! ~ * ' ( ) ; space -> %20 (never '+'); uppercase hex.
+std::string urlEncode(const std::string& s)
+{
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                          c == '.' || c == '!' || c == '~' || c == '*' ||
+                          c == '\'' || c == '(' || c == ')';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0x0F]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+// Lowercase hex MD5 (httplib::detail::MD5, needs CPPHTTPLIB_OPENSSL_SUPPORT).
+std::string md5Hex(const std::string& s) { return httplib::detail::MD5(s); }
+
+// Byte-wise UTF-8 safe truncation: never splits a multi-byte sequence.
+std::string utf8Truncate(const std::string& s, size_t maxBytes)
+{
+    if (s.size() <= maxBytes) return s;
+    size_t cut = maxBytes;
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+    return s.substr(0, cut);
+}
+
+// Escape a UTF-8 string for embedding into a JSON string literal
+// (control bytes -> \u00xx; other bytes, incl. UTF-8, pass through).
+std::string jsonEscape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+    }
+    return out;
+}
+
+// GET .../web-interface/nav and parse the JSON envelope WITHOUT interpreting
+// `code` (nav code -101 for anonymous users is a normal payload; wbi key and
+// myMid reads still need data.wbi_img / data.mid in that case).
+bool fetchNavRoot(Json& out, std::string& err, const std::string& cookie = std::string())
+{
+    out = Json();
+    long status = 0;
+    std::string body;
+    if (!simpleGet("https://api.bilibili.com/x/web-interface/nav", makeBiliHeaders(cookie),
+                   status, body, err, true)) {
+        return false;
+    }
+    if (status != 200) {
+        err = "HTTP请求错误: 状态码 " + numberToStr(status);
+        return false;
+    }
+    if (!parseJsonText(body, out, err)) return false;
+    err.clear();
+    return true;
+}
+
+// PM endpoints may answer with POSITIVE codes (2, 700013, 700014) that
+// biliGetJson's `code < 0` misses — any nonzero code is an error here.
+bool pmEnvelopeError(const Json& root, std::string& err)
+{
+    const Json* codePtr = root.find("code");
+    long long code = codePtr ? codePtr->asInt(0) : 0;
+    if (code == 0) return false;
+    const Json* msg = root.find("message");
+    if (msg == nullptr || msg->type != Json::Type::String) msg = root.find("msg");
+    if (msg != nullptr && msg->type == Json::Type::String && !msg->strVal.empty() &&
+        msg->strVal != "0") {
+        err = msg->strVal;
+    } else {
+        err = "B站请求错误: code = " + numberToStr(code);
+    }
+    return true;
+}
+
+// ---- Wbi signature (send_msg only) -----------------------------------------
+
+constexpr int kMixinKeyEncTab[64] = {
+    46, 47, 18, 2,  53, 8,  23, 32, 15, 50, 10, 31, 58, 3,  45, 35,
+    27, 43, 5,  49, 33, 9,  42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7,  16, 24, 55, 40, 61, 26, 17, 0,  1,  60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6,  63, 57, 62, 11, 36, 20, 34, 44, 52,
+};
+
+// imgKey + subKey (64 chars) permuted through kMixinKeyEncTab, first 32 chars.
+// Self-test vector: img=7cd084941338484aae1ad9425b84077c
+//                   sub=4932caff0ff746eab6f01bf08b70ac45
+//                   -> ea1db124af3c7062474693fa704f4ff8
+std::string wbiMixinKey(const std::string& imgKey, const std::string& subKey)
+{
+    if (imgKey.size() < 32 || subKey.size() < 32) return std::string();
+    std::string raw = imgKey + subKey;
+    std::string out;
+    out.reserve(32);
+    for (int i = 0; i < 32; ++i) out.push_back(raw[static_cast<size_t>(kMixinKeyEncTab[i])]);
+    return out;
+}
+
+// Static (offline) check of the permutation table above; fails loudly with a
+// Chinese error if a future edit corrupts it.
+bool wbiSelfCheck(std::string& err)
+{
+    std::string got =
+        wbiMixinKey("7cd084941338484aae1ad9425b84077c", "4932caff0ff746eab6f01bf08b70ac45");
+    if (got != "ea1db124af3c7062474693fa704f4ff8") {
+        err = "Wbi 密钥自检失败";
+        return false;
+    }
+    return true;
+}
+
+// ".../wbi/<32 hex>.png" -> "<32 hex>" (last path segment, extension stripped).
+std::string wbiKeyFromUrl(const std::string& url)
+{
+    size_t slash = url.rfind('/');
+    std::string seg = (slash == std::string::npos) ? url : url.substr(slash + 1);
+    size_t dot = seg.rfind('.');
+    if (dot != std::string::npos && dot > 0) seg = seg.substr(0, dot);
+    return seg;
+}
+
+struct WbiKeyCache {
+    std::mutex mtx;
+    bool valid = false;
+    std::chrono::steady_clock::time_point fetchedAt{};
+    std::string imgKey;
+    std::string subKey;
+};
+WbiKeyCache g_wbi;
+
+// Mixin key from nav's wbi_img, cached ~30 min; serves the stale cache when
+// the refresh fails.
+bool wbiMixinKeyCached(std::string& keyOut, std::string& err)
+{
+    if (!wbiSelfCheck(err)) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_wbi.mtx);
+        bool fresh = g_wbi.valid &&
+                     (std::chrono::steady_clock::now() - g_wbi.fetchedAt) <
+                         std::chrono::minutes(30);
+        if (fresh) {
+            keyOut = wbiMixinKey(g_wbi.imgKey, g_wbi.subKey);
+            if (keyOut.empty()) {
+                err = "Wbi 密钥获取失败";
+                return false;
+            }
+            err.clear();
+            return true;
+        }
+    }
+    std::string navErr;
+    {
+        Json nav;
+        if (fetchNavRoot(nav, navErr, cookieSnapshot())) {
+            const Json* data = nav.find("data");
+            const Json* wbiImg = (data != nullptr) ? data->find("wbi_img") : nullptr;
+            std::string img, sub;
+            if (wbiImg != nullptr) {
+                const Json* i = wbiImg->find("img_url");
+                const Json* s = wbiImg->find("sub_url");
+                if (i != nullptr) img = wbiKeyFromUrl(i->asString());
+                if (s != nullptr) sub = wbiKeyFromUrl(s->asString());
+            }
+            if (!img.empty() && !sub.empty()) {
+                std::lock_guard<std::mutex> lock(g_wbi.mtx);
+                g_wbi.imgKey = std::move(img);
+                g_wbi.subKey = std::move(sub);
+                g_wbi.valid = true;
+                g_wbi.fetchedAt = std::chrono::steady_clock::now();
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_wbi.mtx);
+    if (!g_wbi.valid) {
+        err = navErr.empty() ? std::string("Wbi 密钥获取失败") : navErr;
+        return false;
+    }
+    keyOut = wbiMixinKey(g_wbi.imgKey, g_wbi.subKey);
+    if (keyOut.empty()) {
+        err = "Wbi 密钥获取失败";
+        return false;
+    }
+    err.clear();
+    return true;
+}
+
+// Build the signed query: params scrubbed of ! ' ( ) * , sorted by key,
+// encodeURIComponent-encoded k=v joined with '&', then
+// "&w_rid=" + md5(query + mixinKey). URL params only — send_msg's msg[...]
+// body is NOT part of the signature.
+std::string wbiSignQuery(std::vector<std::pair<std::string, std::string>> params,
+                         const std::string& mixinKey)
+{
+    for (auto& kv : params) {
+        std::string scrubbed;
+        scrubbed.reserve(kv.second.size());
+        for (char c : kv.second) {
+            if (c == '!' || c == '\'' || c == '(' || c == ')' || c == '*') continue;
+            scrubbed.push_back(c);
+        }
+        kv.second = std::move(scrubbed);
+    }
+    std::sort(params.begin(), params.end(),
+              [](const std::pair<std::string, std::string>& a,
+                 const std::pair<std::string, std::string>& b) { return a.first < b.first; });
+    std::string query;
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (i) query += '&';
+        query += urlEncode(params[i].first) + '=' + urlEncode(params[i].second);
+    }
+    return query + "&w_rid=" + md5Hex(query + mixinKey);
+}
+
+// ---- form POST -------------------------------------------------------------
+
+// Single-shot POST (application/x-www-form-urlencoded), no redirect following,
+// mirroring simpleGet. No content-type gate: parseJsonText reports
+// "http请求错误" for non-JSON bodies anyway, and a wrong-but-JSON content
+// type must not reject a usable payload.
+bool simplePostForm(const std::string& url, const httplib::Headers& headers,
+                    const std::string& body, long& statusOut, std::string& bodyOut,
+                    std::string& err)
+{
+    statusOut = 0;
+    bodyOut.clear();
+    try {
+        UrlParts parts;
+        if (!splitUrl(url, parts, err)) return false;
+        auto client = makeClient(parts);
+        auto res = client->Post(parts.target, headers, body,
+                                "application/x-www-form-urlencoded");
+        if (!res) {
+            err = "网络请求错误: " + describeError(res.error());
+            return false;
+        }
+        statusOut = res->status;
+        bodyOut = std::move(res->body);
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("网络请求错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "网络请求错误: 未知异常";
+        return false;
+    }
+}
+
+// POST form + parse bilibili envelope, like biliGetJson but with the PM
+// envelope rule (any nonzero code fails).
+bool biliPostFormJson(const std::string& url, const std::string& body,
+                      const std::string& requiredKey, Json& out, std::string& err,
+                      const std::string& cookie = std::string())
+{
+    out = Json();
+    long status = 0;
+    std::string resp;
+    if (!simplePostForm(url, makeBiliHeaders(cookie), body, status, resp, err)) {
+        return false;
+    }
+    if (status != 200) {
+        err = "HTTP请求错误: 状态码 " + numberToStr(status);
+        return false;
+    }
+    Json root;
+    if (!parseJsonText(resp, root, err)) return false;
+    if (!root.isObject() || root.obj.empty()) {
+        err = "http请求错误";
+        return false;
+    }
+    if (pmEnvelopeError(root, err)) return false;
+    if (requiredKey.empty()) {
+        out = std::move(root);
+        err.clear();
+        return true;
+    }
+    const Json* required = root.find(requiredKey);
+    if (required == nullptr || required->isNull()) {
+        err = "B站请求错误: code = 0, requiredKey = " + requiredKey;
+        return false;
+    }
+    out = *required;
+    if (out.type == Json::Type::Object && out.obj.empty()) {
+        err = "请求错误: 内容为空";
+        return false;
+    }
+    err.clear();
+    return true;
+}
+
+// csrf (bili_jct) from a "a=1; b=2" cookie snapshot; "" when absent.
+std::string csrfFromCookie(const std::string& cookie)
+{
+    for (const auto& kv : parseCookiePairs(cookie)) {
+        if (kv.first == "bili_jct" && !kv.second.empty()) return kv.second;
+    }
+    return std::string();
+}
+
+// Form-urlencoded body from ordered key/value pairs.
+std::string formEncode(const std::vector<std::pair<std::string, std::string>>& params)
+{
+    std::string out;
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (i) out += '&';
+        out += urlEncode(params[i].first) + '=' + urlEncode(params[i].second);
+    }
+    return out;
+}
+
+// Stable per-process dev_id: UUID v4 (template forces version '4' at index
+// 14, variant 8/9/a/b at index 19).
+std::string devIdOnce()
+{
+    static const std::string kDevId = [] {
+        const char kHex[] = "0123456789abcdef";
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<int> dis(0, 15);
+        std::uniform_int_distribution<int> disVariant(0, 3);
+        const char* tmpl = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx";
+        std::string out(36, '\0');
+        for (size_t i = 0; i < 36; ++i) {
+            char t = tmpl[i];
+            if (t == 'x') out[i] = kHex[dis(gen)];
+            else if (t == 'y') out[i] = "89ab"[disVariant(gen)];
+            else out[i] = t;
+        }
+        return out;
+    }();
+    return kDevId;
 }
 
 // Single-shot GET with redirects disabled; returns the RAW Location header.
@@ -2106,19 +2471,8 @@ bool navLoginState(bool& loggedIn, std::string& uname, std::string& err)
     uname.clear();
     err.clear();
     try {
-        std::string cookie = cookieSnapshot();
-        long status = 0;
-        std::string body;
-        if (!simpleGet("https://api.bilibili.com/x/web-interface/nav", makeBiliHeaders(cookie),
-                       status, body, err, true)) {
-            return false;
-        }
-        if (status != 200) {
-            err = "HTTP请求错误: 状态码 " + numberToStr(status);
-            return false;
-        }
         Json root;
-        if (!parseJsonText(body, root, err)) return false;
+        if (!fetchNavRoot(root, err, cookieSnapshot())) return false;
         const Json* codePtr = root.find("code");
         long long code = codePtr ? codePtr->asInt(0) : 0;
         if (code == -101) {
@@ -2158,6 +2512,322 @@ bool navLoginState(bool& loggedIn, std::string& uname, std::string& err)
     } catch (...) {
         err = "发生错误: 未知异常";
         return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private messages (私信, message/private_msg.md)
+// ---------------------------------------------------------------------------
+
+bool fetchPmSessions(std::vector<PmSession>& out, std::string& err)
+{
+    out.clear();
+    try {
+        std::string url =
+            "https://api.vc.bilibili.com/session_svr/v1/session_svr/get_sessions"
+            "?session_type=4&size=50&sort_rule=1&build=0&mobi_app=web";
+        Json root;
+        if (!biliGetJson(url, "", root, err, cookieSnapshot())) return false;
+        // PM envelopes can carry POSITIVE error codes (2, 700013, 700014)
+        // that biliGetJson's code<0 misses — re-check the envelope here.
+        if (pmEnvelopeError(root, err)) return false;
+        const Json* data = root.find("data");
+        const Json* list = (data != nullptr) ? data->find("session_list") : nullptr;
+        if (list == nullptr || list->type != Json::Type::Array) {
+            // null session_list / missing data -> empty success
+            err.clear();
+            return true;
+        }
+        std::vector<std::pair<long long, PmSession>> items;
+        items.reserve(list->arr.size());
+        for (const Json& e : list->arr) {
+            if (!e.isObject()) continue;
+            // Only user sessions; everything else (system/notice) is dropped.
+            long long sessionType = 0;
+            const Json* st = e.find("session_type");
+            if (st != nullptr) sessionType = st->asInt(0);
+            long long systemType = 0;
+            const Json* sst = e.find("system_msg_type");
+            if (sst != nullptr) systemType = sst->asInt(0);
+            if (sessionType != 1 || systemType != 0) continue;
+            PmSession s;
+            const Json* v;
+            if ((v = e.find("talker_id")) != nullptr) s.talkerId = v->asInt(0);
+            if ((v = e.find("unread_count")) != nullptr) s.unread = static_cast<int>(v->asInt(0));
+            if ((v = e.find("ack_seqno")) != nullptr) s.ackSeqno = v->asInt(0);
+            if ((v = e.find("max_seqno")) != nullptr) s.maxSeqno = v->asInt(0);
+            const Json* last = e.find("last_msg");
+            if (last != nullptr && last->isObject()) {
+                if ((v = last->find("sender_uid")) != nullptr) s.lastSender = v->asInt(0);
+                if ((v = last->find("msg_type")) != nullptr) s.lastMsgType = static_cast<int>(v->asInt(0));
+            }
+            long long ts = 0;
+            if ((v = e.find("session_ts")) != nullptr) ts = v->asInt(0);
+            items.emplace_back(ts, std::move(s));
+        }
+        // Newest activity first (session_ts is microseconds), stable, cap 50.
+        std::stable_sort(items.begin(), items.end(),
+                         [](const std::pair<long long, PmSession>& a,
+                            const std::pair<long long, PmSession>& b) {
+                             return a.first > b.first;
+                         });
+        if (items.size() > 50) items.resize(50);
+        out.reserve(items.size());
+        for (auto& it : items) out.push_back(std::move(it.second));
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+bool fetchPmMessages(long long talkerId, long long beginSeqno, int size,
+                     std::vector<PmMessage>& out, std::string& err)
+{
+    out.clear();
+    try {
+        if (size < 1) size = 1;
+        if (size > 200) size = 200;
+        std::string url =
+            "https://api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs"
+            "?talker_id=" + numberToStr(talkerId) +
+            "&session_type=1&size=" + numberToStr(size) +
+            "&begin_seqno=" + numberToStr(beginSeqno) +
+            "&sender_device_id=1&build=0&mobi_app=web";
+        Json root;
+        if (!biliGetJson(url, "", root, err, cookieSnapshot())) return false;
+        if (pmEnvelopeError(root, err)) return false;
+        const Json* data = root.find("data");
+        const Json* msgs = (data != nullptr) ? data->find("messages") : nullptr;
+        if (msgs == nullptr || msgs->type != Json::Type::Array) {
+            // null messages / missing data -> empty success
+            err.clear();
+            return true;
+        }
+        for (const Json& e : msgs->arr) {
+            if (!e.isObject()) continue;
+            PmMessage m;
+            const Json* v;
+            if ((v = e.find("sender_uid")) != nullptr) m.senderUid = v->asInt(0);
+            // Field is msg_seqno in the response (seqno as fallback).
+            if ((v = e.find("msg_seqno")) != nullptr) m.seqno = v->asInt(0);
+            else if ((v = e.find("seqno")) != nullptr) m.seqno = v->asInt(0);
+            if ((v = e.find("timestamp")) != nullptr) m.timestamp = v->asInt(0);
+            if ((v = e.find("msg_type")) != nullptr) m.msgType = static_cast<int>(v->asInt(0));
+            if ((v = e.find("msg_status")) != nullptr) m.msgStatus = static_cast<int>(v->asInt(0));
+            if ((v = e.find("content")) != nullptr) m.content = v->asString();
+            if (m.seqno > beginSeqno) out.push_back(std::move(m));
+        }
+        // NEWEST FIRST (reverse order) per contract.
+        std::stable_sort(out.begin(), out.end(),
+                         [](const PmMessage& a, const PmMessage& b) {
+                             return a.seqno > b.seqno;
+                         });
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+bool myMid(long long& mid, std::string& err)
+{
+    mid = 0;
+    try {
+        std::string cookie = cookieSnapshot();
+        Json nav;
+        std::string navErr;
+        bool navOk = fetchNavRoot(nav, navErr, cookie);
+        if (navOk) {
+            const Json* codePtr = nav.find("code");
+            long long code = codePtr ? codePtr->asInt(0) : 0;
+            if (code == 0) {
+                const Json* data = nav.find("data");
+                const Json* m = (data != nullptr) ? data->find("mid") : nullptr;
+                if (m != nullptr) {
+                    long long v = m->asInt(0);
+                    if (v > 0) {
+                        mid = v;
+                        err.clear();
+                        return true;
+                    }
+                }
+            }
+        }
+        // Fallback: DedeUserID cookie (all digits, <=18 chars, > 0).
+        for (const auto& kv : parseCookiePairs(cookie)) {
+            if (kv.first != "DedeUserID") continue;
+            const std::string& s = kv.second;
+            if (s.empty() || s.size() > 18) continue;
+            long long v = 0;
+            bool allDigits = true;
+            for (char c : s) {
+                if (c < '0' || c > '9') { allDigits = false; break; }
+                v = v * 10 + (c - '0');
+            }
+            if (allDigits && v > 0) {
+                mid = v;
+                err.clear();
+                return true;
+            }
+        }
+        // Prefer the nav network/parse error when the fetch itself failed.
+        err = navOk ? std::string("未登录: 无法获取用户 mid") : navErr;
+        if (err.empty()) err = "未登录: 无法获取用户 mid";
+        return false;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+bool markPmRead(long long talkerId, long long ackSeqno, std::string& err)
+{
+    try {
+        std::string cookie = cookieSnapshot();
+        std::string csrf = csrfFromCookie(cookie);
+        if (csrf.empty()) {
+            err = "鉴权错误: 缺少 bili_jct cookie";
+            return false;
+        }
+        std::vector<std::pair<std::string, std::string>> form = {
+            {"talker_id", numberToStr(talkerId)},
+            {"session_type", "1"},
+            {"csrf", csrf},
+            {"csrf_token", csrf},
+        };
+        // ack_seqno=0 -> omit the field (empty means "up to the newest").
+        if (ackSeqno != 0) form.emplace_back("ack_seqno", numberToStr(ackSeqno));
+        std::string url =
+            "https://api.vc.bilibili.com/session_svr/v1/session_svr/update_ack";
+        Json root;
+        if (!biliPostFormJson(url, formEncode(form), "", root, err, cookie)) {
+            return false;
+        }
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+bool sendPmText(long long receiverUid, const std::string& text, std::string& err)
+{
+    try {
+        std::string cookie = cookieSnapshot();
+        std::string csrf = csrfFromCookie(cookie);
+        if (csrf.empty()) {
+            err = "鉴权错误: 缺少 bili_jct cookie";
+            return false;
+        }
+        long long sender = 0;
+        if (!myMid(sender, err)) return false;
+        std::string mixinKey;
+        if (!wbiMixinKeyCached(mixinKey, err)) return false;
+        std::string devId = devIdOnce();
+        long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+        // Byte-truncate to the 2000-byte limit BEFORE jsonEscape (never
+        // shrink after escaping — that could split an escape sequence).
+        std::string clipped = utf8Truncate(text, 2000);
+        // Signed set = URL query {w_sender_uid, w_receiver_id, w_dev_id, wts}
+        // only; the msg[...] body is NOT part of the signature.
+        std::vector<std::pair<std::string, std::string>> signParams = {
+            {"w_sender_uid", numberToStr(sender)},
+            {"w_receiver_id", numberToStr(receiverUid)},
+            {"w_dev_id", devId},
+            {"wts", numberToStr(now)},
+        };
+        std::string query = wbiSignQuery(std::move(signParams), mixinKey);
+        std::vector<std::pair<std::string, std::string>> form = {
+            {"msg[sender_uid]", numberToStr(sender)},
+            {"msg[receiver_id]", numberToStr(receiverUid)},
+            {"msg[receiver_type]", "1"},
+            {"msg[msg_type]", "1"},
+            {"msg[msg_status]", "0"},
+            {"msg[dev_id]", devId},
+            {"msg[timestamp]", numberToStr(now)},
+            {"msg[new_face_version]", "1"},
+            {"msg[content]", "{\"content\":\"" + jsonEscape(clipped) + "\"}"},
+            {"csrf", csrf},
+            {"csrf_token", csrf},
+            {"build", "0"},
+            {"mobi_app", "web"},
+        };
+        std::string url =
+            "https://api.vc.bilibili.com/web_im/v1/web_im/send_msg?" + query;
+        Json root;
+        if (!biliPostFormJson(url, formEncode(form), "", root, err, cookie)) {
+            return false;
+        }
+        // Success: the server marks the target session read automatically
+        // (发送私信 doc note) — no extra update_ack needed here.
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+std::string pmVideoLink(const PmMessage& m)
+{
+    try {
+        Json j;
+        std::string junk;
+        if (!parseJsonText(m.content, j, junk)) return std::string();
+        if (m.msgType == 7) {
+            const Json* source = j.find("source");
+            long long src = (source != nullptr) ? source->asInt(0) : 0;
+            const Json* url = j.find("url");
+            std::string u = (url != nullptr) ? url->asString() : std::string();
+            if (src == 5 && !u.empty()) return u;
+            const Json* bvid = j.find("bvid");
+            std::string b = (bvid != nullptr) ? bvid->asString() : std::string();
+            if (!b.empty()) return "https://www.bilibili.com/video/" + b;
+            return std::string();
+        }
+        if (m.msgType == 1) {
+            const Json* c = j.find("content");
+            if (c == nullptr || c->type != Json::Type::String) return std::string();
+            const std::string& text = c->strVal;
+            auto isSpace = [](char ch) {
+                return std::isspace(static_cast<unsigned char>(ch)) != 0;
+            };
+            size_t i = 0;
+            while (i < text.size()) {
+                while (i < text.size() && isSpace(text[i])) ++i;
+                size_t start = i;
+                while (i < text.size() && !isSpace(text[i])) ++i;
+                if (i > start) {
+                    std::string tok = text.substr(start, i - start);
+                    if (looksLikeBiliUrl(tok)) return tok;
+                }
+            }
+            return std::string();
+        }
+        return std::string();
+    } catch (...) {
+        return std::string();
     }
 }
 

@@ -10,6 +10,7 @@ class QPushButton;
 class QTabWidget;
 
 class DownloadTab;
+class MessageTab;
 class SummaryTab;
 class TranscribeTab;
 
@@ -49,6 +50,7 @@ private:
     DownloadTab* downloadTab_ = nullptr;
     TranscribeTab* transcribeTab_ = nullptr;
     SummaryTab* summaryTab_ = nullptr;
+    MessageTab* messageTab_ = nullptr;
 
     QLabel* loginPill_ = nullptr;
     QPushButton* loginBtn_ = nullptr;

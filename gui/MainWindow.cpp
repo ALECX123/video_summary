@@ -2,6 +2,7 @@
 
 #include "BiliDownload.h"
 #include "DownloadTab.h"
+#include "MessageTab.h"
 #include "QRLoginDialog.h"
 #include "SummaryTab.h"
 #include "Theme.h"
@@ -60,10 +61,12 @@ void MainWindow::buildUi() {
     downloadTab_ = new DownloadTab(tabs_);
     transcribeTab_ = new TranscribeTab(tabs_);
     summaryTab_ = new SummaryTab(tabs_);
+    messageTab_ = new MessageTab(tabs_);
 
     tabs_->addTab(downloadTab_, tr("① 下载视频"));
     tabs_->addTab(transcribeTab_, tr("② 生成字幕"));
     tabs_->addTab(summaryTab_, tr("③ 总结内容"));
+    tabs_->addTab(messageTab_, tr("④ 私信助手"));
 
     // --- 状态栏: 左 = 任务状态, 右 = 登录状态胶囊 ---
     statusBar()->showMessage(tr("就绪"));
@@ -73,12 +76,13 @@ void MainWindow::buildUi() {
     statusBar()->addPermanentWidget(loginPill_);
     setLoginState(false, QString());
 
-    auto relay = [this](const QString& text) { 
-        statusBar()->showMessage(text); 
-        };
-    connect(downloadTab_, &DownloadTab::statusChanged, this, relay);
-    connect(transcribeTab_, &TranscribeTab::statusChanged, this, relay);
-    connect(summaryTab_, &SummaryTab::statusChanged, this, relay);
+    //auto relay = [this](const QString& text) { 
+    //    statusBar()->showMessage(text); 
+    //    };
+    //connect(downloadTab_, &DownloadTab::statusChanged, this, relay);
+    //connect(transcribeTab_, &TranscribeTab::statusChanged, this, relay);
+    //connect(summaryTab_, &SummaryTab::statusChanged, this, relay);
+    //connect(messageTab_, &MessageTab::statusChanged, this, relay);
 }
 
 // ---------------------------------------------------------------------------

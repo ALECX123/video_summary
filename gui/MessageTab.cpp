@@ -63,6 +63,13 @@ namespace {
 		return q;
 	}
 
+	// 发送内容的单行预览: 压平换行并截断 (完整总结较长, 日志只给摘要)。
+	QString contentPreview(const QString& text) {
+		QString q = text.simplified();
+		if (q.size() > 80) q = q.left(80) + QStringLiteral("…");
+		return q;
+	}
+
 	std::string readFileUtf8(const fs::path& p) {
 		std::ifstream ifs(p, std::ios::binary);
 		if (!ifs) return {};
@@ -285,7 +292,8 @@ void MessageTab::pollOnce() {
 					.arg(session.talkerId)
 					.arg(QString::fromUtf8(link)));
 			}
-			else if (m.msgType == 1) {
+			else {
+				// 所有非链接的收到消息都上屏 (文本给正文预览, 其它类型给原始内容预览)。
 				emit logReady(QStringLiteral("%1 发来消息: %2")
 					.arg(session.talkerId)
 					.arg(textPreview(m)));
@@ -419,7 +427,9 @@ void MessageTab::processJob(const Job& job) {
 	std::string sendErr;
 	const std::string reply = "《" + info.title + "》\n\n" + content;
 	if (bili::sendPmText(job.talkerId, reply, sendErr)) {
-		emit logReady(QStringLiteral("已回复 %1").arg(job.talkerId));
+		emit logReady(QStringLiteral("已回复 %1: %2")
+			.arg(job.talkerId)
+			.arg(contentPreview(QString::fromUtf8(reply))));
 	}
 	else {
 		emit logReady(QStringLiteral("回复 %1 失败: %2")
@@ -436,7 +446,11 @@ void MessageTab::failJob(const Job& job, const QString& title, const QString& re
 	const std::string msg = "视频《" + t.toUtf8().toStdString() + "》处理失败：" +
 		reason.toUtf8().toStdString();
 	std::string sendErr;
-	if (!bili::sendPmText(job.talkerId, msg, sendErr)) {
+	if (bili::sendPmText(job.talkerId, msg, sendErr)) {
+		emit logReady(QStringLiteral("已回发失败通知 %1: %2")
+			.arg(job.talkerId)
+			.arg(contentPreview(QString::fromUtf8(msg))));
+	} else {
 		emit logReady(QStringLiteral("失败通知回发 %1 也失败: %2")
 			.arg(job.talkerId)
 			.arg(QString::fromUtf8(sendErr)));

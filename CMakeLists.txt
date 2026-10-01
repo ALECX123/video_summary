@@ -180,13 +180,16 @@ elseif(NOT VSUM_BILI_ENABLED)
 elseif(NOT VSUM_GUI_CPP)
     set(VSUM_GUI_SKIP "no gui/*.cpp present")
 endif()
+set(RES_FILE "${CMAKE_SOURCE_DIR}/res/app.rc")
+#set(QRES_FILE "${CMAKE_SOURCE_DIR}/res/app.qrc")
 
 if(VSUM_GUI_SKIP STREQUAL "")
-    add_executable(video_summary_gui ${VSUM_GUI_CPP} ${VSUM_GUI_HDR} ${VSUM_GUI_UI})
+    add_executable(video_summary_gui ${VSUM_GUI_CPP} ${VSUM_GUI_HDR} ${VSUM_GUI_UI} ${RES_FILE} ${QRES_FILE})
 
     set_target_properties(video_summary_gui PROPERTIES
         AUTOMOC ON                 # per-target; CMAKE_AUTOMOC stays off globally
         AUTOUIC ON                 # #include "ui_xxx.h" -> gui/xxx.ui via uic
+        AUTORCC ON
         WIN32_EXECUTABLE TRUE
     )
 

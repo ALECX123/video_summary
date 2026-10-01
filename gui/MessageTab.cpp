@@ -264,7 +264,7 @@ void MessageTab::pollOnce() {
 		}
 
 		std::vector<bili::PmMessage> msgs;
-		if (!bili::fetchPmMessages(session.talkerId, it->second, 20, msgs, err)) {
+		if (!bili::fetchPmMessages(session.talkerId, it->second, 1, msgs, err)) {
 			emit logReady(QStringLiteral("获取 %1 的私信失败: %2")
 				.arg(session.talkerId)
 				.arg(QString::fromUtf8(err)));

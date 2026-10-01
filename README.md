@@ -96,6 +96,7 @@ video_summary [options] <输入文件>
 | `--ollama-url <url>` | Ollama 地址，默认 `http://127.0.0.1:11434` |
 | `--ollama-model <name>` | Ollama 模型，默认 `qwen3:8b` |
 | `--no-summary` | 跳过总结，只出字幕 |
+| `--no-gpu` | 强制用 CPU 转写（默认开启 GPU/CUDA 加速） |
 | `-h` | 中文帮助 |
 
 ### 完整示例

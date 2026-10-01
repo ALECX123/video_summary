@@ -9,6 +9,10 @@ class QLabel;
 class QPushButton;
 class QTimer;
 
+namespace Ui {
+class QRLoginDialog;
+}
+
 // 哔哩哔哩扫码登录对话框。
 // qrStart 生成二维码 -> nayuki qrcodegen 渲染成图片 -> 每 2 秒 qrPoll 一次:
 //   Waiting  请用手机B站扫码
@@ -34,6 +38,8 @@ private:
     bool startQr();
     void renderQrImage(const std::string& qrUrl);
     void setStatus(const QString& text, const char* role);
+
+    Ui::QRLoginDialog* ui = nullptr;
 
     QLabel* qrLabel_ = nullptr;
     QLabel* statusLabel_ = nullptr;

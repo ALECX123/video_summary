@@ -47,6 +47,8 @@ const LangItem kLanguages[] = {
 }  // namespace
 
 TranscribeTab::TranscribeTab(QWidget* parent) : QWidget(parent) {
+	ui = new Ui::TranscribeTab;
+
     ui->setupUi(this);
 
     // --- 成员别名 (ui 对象名即 QSS 角色) ---

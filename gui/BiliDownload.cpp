@@ -1858,7 +1858,7 @@ bool download(const std::string& url, const std::filesystem::path& outDir,
         // ---- temp file names: <title>.Video.<ext> / <title>.Audio.<ext> ----
         std::string baseName = legalizedFileName(info.title);
         if (baseName.empty()) baseName = "bilibili_video";
-        std::filesystem::path basePath = outDir / baseName;
+        std::filesystem::path basePath = outDir / widen(baseName);
 
         auto extOf = [](const std::string& u) -> std::string {
             auto q = u.find('?');

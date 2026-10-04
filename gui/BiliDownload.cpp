@@ -2638,6 +2638,166 @@ bool fetchPmMessages(long long talkerId, long long beginSeqno, int size,
     }
 }
 
+// ---------------------------------------------------------------------------
+// 通知消息 (回复我的 / @我, message/msg.md)
+// ---------------------------------------------------------------------------
+
+bool fetchMsgFeedUnread(MsgFeedUnread& out, std::string& err)
+{
+    out = MsgFeedUnread();
+    try {
+        const std::string url =
+            "https://api.vc.bilibili.com/x/im/web/msgfeed/unread"
+            "?build=0&mobi_app=web";
+        Json root;
+        if (!biliGetJson(url, "", root, err, cookieSnapshot())) return false;
+        const Json* data = root.find("data");
+        if (data == nullptr || !data->isObject()) {
+            err = "请求错误: 内容为空";
+            return false;
+        }
+        const Json* v;
+        if ((v = data->find("at")) != nullptr) out.at = static_cast<int>(v->asInt(0));
+        if ((v = data->find("reply")) != nullptr) out.reply = static_cast<int>(v->asInt(0));
+        // 新接口的 recv_reply = reply + at; 缺字段时按 msg.md 自行相加。
+        if ((v = data->find("recv_reply")) != nullptr) {
+            out.recvReply = static_cast<int>(v->asInt(0));
+        } else {
+            out.recvReply = out.at + out.reply;
+        }
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+bool fetchReplyNotices(std::vector<ReplyNotice>& out, std::string& err)
+{
+    out.clear();
+    try {
+        // "@我的" 通知 (与 unread 接口的 data.at 计数对应)。
+        const std::string url =
+            "https://api.bilibili.com/x/msgfeed/at"
+            "?platform=web&build=0&mobi_app=web";
+        Json root;
+        if (!biliGetJson(url, "", root, err, cookieSnapshot())) return false;
+        const Json* data = root.find("data");
+        const Json* items = (data != nullptr) ? data->find("items") : nullptr;
+        if (items == nullptr || items->type != Json::Type::Array) {
+            // 无 data / 无 items -> 空列表是正常结果
+            err.clear();
+            return true;
+        }
+        out.reserve(items->arr.size());
+        for (const Json& e : items->arr) {
+            if (!e.isObject()) continue;
+            ReplyNotice n;
+            const Json* v;
+            if ((v = e.find("id")) != nullptr) n.id = v->asInt(0);
+            if ((v = e.find("at_time")) != nullptr) n.atTime = v->asInt(0);
+            const Json* user = e.find("user");
+            if (user != nullptr && user->isObject()) {
+                if ((v = user->find("mid")) != nullptr) n.userMid = v->asInt(0);
+                if ((v = user->find("nickname")) != nullptr) n.nickname = v->asString();
+                if ((v = user->find("follow")) != nullptr) n.follow = v->asBool(false);
+            }
+            const Json* item = e.find("item");
+            if (item != nullptr && item->isObject()) {
+                if ((v = item->find("title")) != nullptr) n.title = v->asString();
+                if ((v = item->find("uri")) != nullptr) n.uri = v->asString();
+                if ((v = item->find("native_uri")) != nullptr) n.nativeUri = v->asString();
+                if ((v = item->find("image")) != nullptr) n.image = v->asString();
+                if ((v = item->find("type")) != nullptr) n.type = v->asString();
+                if ((v = item->find("business")) != nullptr) n.business = v->asString();
+                if ((v = item->find("business_id")) != nullptr) n.businessId = v->asInt(0);
+                if ((v = item->find("subject_id")) != nullptr) n.subjectId = v->asInt(0);
+                if ((v = item->find("root_id")) != nullptr) n.rootId = v->asInt(0);
+                if ((v = item->find("target_id")) != nullptr) n.targetId = v->asInt(0);
+                if ((v = item->find("source_id")) != nullptr) n.sourceId = v->asInt(0);
+                if ((v = item->find("detail_title")) != nullptr) n.detailTitle = v->asString();
+                if ((v = item->find("root_reply_content")) != nullptr) {
+                    n.rootReplyContent = v->asString();
+                }
+                if ((v = item->find("source_content")) != nullptr) {
+                    n.sourceContent = v->asString();
+                }
+                if ((v = item->find("target_reply_content")) != nullptr) {
+                    n.targetReplyContent = v->asString();
+                }
+                // at_details: 被@的用户数组, 元素结构与 user 同构 (mid/nickname/follow)。
+                const Json* ats = item->find("at_details");
+                if (ats != nullptr && ats->type == Json::Type::Array) {
+                    n.atDetails.reserve(ats->arr.size());
+                    for (const Json& a : ats->arr) {
+                        if (!a.isObject()) continue;
+                        NoticeUser u;
+                        if ((v = a.find("mid")) != nullptr) u.mid = v->asInt(0);
+                        if ((v = a.find("nickname")) != nullptr) u.nickname = v->asString();
+                        if ((v = a.find("follow")) != nullptr) u.follow = v->asBool(false);
+                        n.atDetails.push_back(std::move(u));
+                    }
+                }
+            }
+            out.push_back(std::move(n));
+        }
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
+bool fetchRelations(const std::vector<long long>& mids,
+                    std::unordered_map<long long, bool>& followsMe,
+                    std::string& err)
+{
+    followsMe.clear();
+    if (mids.empty()) {
+        err.clear();
+        return true;
+    }
+    try {
+        std::string cookie = cookieSnapshot();
+        for (long long mid : mids) {
+            if (mid <= 0) continue;
+            // 关系查询用接口2 (无需 Wbi): data.relation = 目标用户对于当前用户的关系
+            const std::string url =
+                "https://api.bilibili.com/x/web-interface/relation?mid=" +
+                numberToStr(mid);
+            Json root;
+            if (!biliGetJson(url, "", root, err, cookie)) return false;
+            const Json* data = root.find("data");
+            const Json* relation = (data != nullptr) ? data->find("be_relation") : nullptr;
+            if (relation == nullptr || !relation->isObject()) {
+                // 无 relation 对象 -> 视为未关注我, 继续查下一个
+                followsMe[mid] = false;
+                continue;
+            }
+            const Json* attr = relation->find("attribute");
+            const long long a = (attr != nullptr) ? attr->asInt(0) : 0;
+            // attribute: 0=未关注 1=悄悄关注(已弃用) 2=已关注 6=互粉 128=拉黑
+            followsMe[mid] = (a > 0 && a < 128);
+        }
+        err.clear();
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) {
+        err = "发生错误: 未知异常";
+        return false;
+    }
+}
+
 bool myMid(long long& mid, std::string& err)
 {
     mid = 0;

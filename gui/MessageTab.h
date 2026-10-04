@@ -94,5 +94,11 @@ private:
     QString lastPollErr_;
     QString lastAckErr_;  // 上一次设置已读的错误, 用于去重日志。
 
+    // 通知消息 (msgfeed/unread + msgfeed/at), 仅轮询线程访问。
+    long long lastAtUnread_ = -1;     // 上次未读@数 (-1 = 未取到, 变化才记日志)
+    QString lastFeedErr_;             // 上次通知接口错误, 用于去重日志
+    QString lastRelErr_;              // 上次查询关注关系的错误, 用于去重日志
+    std::unordered_set<long long> noticeSeen_;  // 已处理的通知 id
+
     bool running_ = false;
 };

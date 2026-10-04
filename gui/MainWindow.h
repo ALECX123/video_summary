@@ -39,6 +39,7 @@ private slots:
 
 private:
     void buildUi();
+    void restoreCredentials();  // 只恢复 Cookie/登录标记, 不碰 UI (buildUi 之前调用)
     void restoreSession();
     void saveSession();
     void startLoginProbe();

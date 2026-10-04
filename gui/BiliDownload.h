@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bili {
@@ -109,6 +110,66 @@ bool markPmRead(long long talkerId, long long ackSeqno, std::string& err);
 // Own mid: api.bilibili.com nav data.mid, falling back to the DedeUserID
 // cookie. false + err when neither is available (not logged in).
 bool myMid(long long& mid, std::string& err);
+
+// ---------------- 通知消息 (回复我的 / @我, message/msg.md) ----------------
+
+// Unread counters of the NEW endpoint (the old api.bilibili.com/x/msgfeed/
+// unread is not used). This endpoint does NOT report private-message counts.
+struct MsgFeedUnread {
+    int at = 0;         // 未读 @ 我的数量
+    int reply = 0;      // 未读回复数
+    int recvReply = 0;  // 未读回复与 @ 数 (= reply + at)
+};
+
+// One entry of data.items of "@我的" (被@通知, x/msgfeed/at). Kept in API
+// order (newest first); the caller dedupes by id.
+struct NoticeUser {
+    long long mid = 0;     // 用户 mid
+    std::string nickname;  // 昵称
+    bool follow = false;   // 是否关注该用户
+};
+
+struct ReplyNotice {
+    long long id = 0;         // 通知 id
+    long long userMid = 0;    // 发出该通知的用户 mid (Job::talkerId 的来源)
+    std::string nickname;     // 该用户昵称
+    bool follow = false;      // 是否关注该用户
+    long long atTime = 0;     // at_time 被@时间 (unix 秒)
+    std::string title;        // item.title 被@视频/动态的标题
+    std::string uri;          // item.uri web 端跳转链接
+    std::string nativeUri;    // item.native_uri 客户端跳转链接
+    std::string image;        // item.image 封面图 URL
+    std::string type;         // item.type 如 "reply"
+    std::string business;     // item.business "评论" / "视频" 等
+    long long businessId = 0; // item.business_id 1=视频评论, 11=动态评论
+    long long subjectId = 0;  // item.subject_id 主体 id (视频为 oid)
+    long long rootId = 0;     // item.root_id 最顶层评论 id
+    long long targetId = 0;   // item.target_id 被回复的评论 id
+    long long sourceId = 0;   // item.source_id 直接回复的评论 id
+    std::string detailTitle;  // item.detail_title 详细标题 (通常为空)
+    std::string rootReplyContent;   // item.root_reply_content 最顶层评论内容
+    std::string sourceContent;      // item.source_content 直接回复的评论内容
+    std::string targetReplyContent; // item.target_reply_content 被回复的评论内容
+    std::vector<NoticeUser> atDetails;  // item.at_details 被@的用户列表
+};
+
+// GET api.vc.bilibili.com/x/im/web/msgfeed/unread?build=0&mobi_app=web
+bool fetchMsgFeedUnread(MsgFeedUnread& out, std::string& err);
+
+// GET api.bilibili.com/x/msgfeed/at?platform=web&build=0&mobi_app=web
+bool fetchReplyNotices(std::vector<ReplyNotice>& out, std::string& err);
+
+// 批量查询"对方是否关注了我" (message/docs/user/relation.md 查询用户与自己关系):
+//   接口2  GET api.bilibili.com/x/web-interface/relation?mid=<目标mid>  (逐个查询, 免 Wbi)
+//   接口1  GET api.bilibili.com/x/space/wbi/acc/relation?mid=<目标mid>  (需 Wbi 签名, 未使用)
+// 回复 data.relation  = 目标用户对于当前用户的关系  <- 本函数取这个 (对方是否关注了我)
+//      data.be_relation = 当前用户对于目标用户的关系 (我是否关注对方, 未使用)
+// attribute: 0=未关注 1=悄悄关注(已弃用) 2=已关注 6=互粉 128=拉黑
+// followsMe[mid] = attribute>0 && attribute<128。
+// 任一查询失败即返回 false (调用方应跳过本轮, 不要回退到 msgfeed 的 follow 字段)。
+bool fetchRelations(const std::vector<long long>& mids,
+                    std::unordered_map<long long, bool>& followsMe,
+                    std::string& err);
 
 // Best-effort video link extraction from a received message:
 //   msg_type 1 -> first whitespace-delimited token of the inner text that

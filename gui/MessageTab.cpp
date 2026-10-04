@@ -232,6 +232,168 @@ void MessageTab::pollTick() {
 }
 
 void MessageTab::pollOnce() {
+	// --- 通知消息 (message/msg.md: 未读计数 + @我的) ---
+	// 新接口只给计数: 先取未读@数, 再用 msgfeed/at 取被@的通知内容。
+	// 首轮无条件拉一次列表只建基线 (跳过已有历史), 之后仅在有未读@时才请求。
+	{
+		bili::MsgFeedUnread unread;
+		std::string feedErr;
+		if (!bili::fetchMsgFeedUnread(unread, feedErr)) {
+			const QString q = QString::fromUtf8(feedErr);
+			if (q != lastFeedErr_) {  // 连续同类错误只记一次
+				emit logReady(QStringLiteral("获取未读通知失败: %1").arg(q));
+				lastFeedErr_ = q;
+			}
+		}
+		else {
+			lastFeedErr_.clear();
+			if (unread.at != lastAtUnread_) {  // 计数变化才上屏, 避免每拍刷屏
+				emit logReady(QStringLiteral("未读@我的数量: %1").arg(unread.at));
+				lastAtUnread_ = unread.at;
+			}
+			// msg.md 没有"标记已读"接口, 未读数会一直 > 0: 本轮是否拉列表只
+			// 决定请求量, 真正防止重复处理的是下面的 noticeSeen_ 按 id 去重。
+			// 内容取的是 @我的 通知, 所以只看 data.at 计数。
+			if (unread.at > 0) {
+				std::vector<bili::ReplyNotice> notices;
+				if (!bili::fetchReplyNotices(notices, feedErr)) {
+					const QString q = QString::fromUtf8(feedErr);
+					if (q != lastFeedErr_) {
+						emit logReady(QStringLiteral("获取@我的通知失败: %1").arg(q));
+						lastFeedErr_ = q;
+					}
+				}
+				else {
+					lastFeedErr_.clear();
+					// 未读@数 = 最新的 N 条 (B站打开@页整页标已读, 未读恒为最新一段),
+					// 所以读取的 notices 只取前 data.at 条, 窗口外的视为已读。
+					const size_t unreadAt =
+						unread.at > 0 ? static_cast<size_t>(unread.at) : 0;
+					std::vector<size_t> todo;  // 本轮要处理的通知下标
+
+					for (size_t i = 0; i < notices.size(); ++i) {
+						const bili::ReplyNotice& n = notices[i];
+						if (stop_) return;
+						if (n.id <= 0) continue;  // 无 id 无法去重, 直接丢弃
+						QString atStr;
+						for (const auto& u : n.atDetails)
+						{
+							atStr += QString("[mid:%1, nick:%2] ").arg(u.mid).arg(QString::fromStdString(u.nickname));
+						}
+						emit logReady(QStringLiteral("历史回复通知[仅建基线] id:%1, userMid:%2, nickname:%3, follow:%4, atTime:%5, title:%6, nativeUri:%7, uri:%8, business:%9, businessId:%10, detailTitle:%11, rootReplyContent:%12, sourceContent:%13, targetReplyContent:%14, atDetails:%15")
+							.arg(n.id)
+							.arg(n.userMid)
+							.arg(QString::fromStdString(n.nickname).toHtmlEscaped())
+							.arg(n.follow ? "true" : "false")
+							.arg(n.atTime)
+							.arg(QString::fromStdString(n.title).toHtmlEscaped())
+							.arg(QString::fromStdString(n.nativeUri).toHtmlEscaped())
+							.arg(QString::fromStdString(n.uri).toHtmlEscaped())
+							.arg(QString::fromStdString(n.business).toHtmlEscaped())
+							.arg(n.businessId)
+							.arg(QString::fromStdString(n.detailTitle).toHtmlEscaped())
+							.arg(QString::fromStdString(n.rootReplyContent).toHtmlEscaped())
+							.arg(QString::fromStdString(n.sourceContent).toHtmlEscaped())
+							.arg(QString::fromStdString(n.targetReplyContent).toHtmlEscaped())
+							.arg(atStr.toHtmlEscaped())
+						);
+						if (noticeSeen_.count(n.id) != 0) continue;
+						if (noticeSeen_.size() >= 4096) noticeSeen_.clear();  // 去重集合封顶
+						if (i >= unreadAt) {  // 未读@窗口外 = 已读, 记为历史
+							noticeSeen_.insert(n.id);
+							continue;
+						}
+						if (n.userMid <= 0) {  // 没有 mid 无法回发私信
+							noticeSeen_.insert(n.id);
+							continue;
+						}
+						todo.push_back(i);
+					}
+
+					// 关注判断: msgfeed/at 的 user.follow 不可靠, 改用关系接口
+					// (x/web-interface/relation) 逐个查"对方是否关注了我"。
+					std::unordered_map<long long, bool> followsMe;
+					if (!todo.empty()) {
+						std::unordered_set<long long> uniq;
+						std::vector<long long> mids;
+						mids.reserve(todo.size());
+						for (size_t k : todo) {
+							const long long mid = notices[k].userMid;
+							if (uniq.insert(mid).second) mids.push_back(mid);
+						}
+						std::string relErr;
+						if (!bili::fetchRelations(mids, followsMe, relErr)) {
+							const QString q = QString::fromUtf8(relErr);
+							if (q != lastRelErr_) {  // 连续同类错误只记一次
+								emit logReady(QStringLiteral("查询关注关系失败, 本轮跳过: %1").arg(q));
+								lastRelErr_ = q;
+							}
+							todo.clear();  // 未写入 seen_, 下一轮重试
+						}
+						else {
+							lastRelErr_.clear();
+						}
+					}
+
+					for (size_t k : todo) {
+						const bili::ReplyNotice& n = notices[k];
+						if (stop_) return;
+						noticeSeen_.insert(n.id);
+
+						const auto rel = followsMe.find(n.userMid);
+						if (rel == followsMe.end() || !rel->second) {
+							emit logReady(QStringLiteral("@我的通知 %1 未关注我, 跳过: %2")
+								.arg(n.userMid)
+								.arg(contentPreview(QString::fromUtf8(n.title))));
+							continue;
+						}
+						// 关注用户才解析 url: 去掉 #fragment 后按视频链接判别。
+						std::string uri = n.uri;
+						const size_t hash = uri.find('#');
+						if (hash != std::string::npos) uri.erase(hash);
+						if (uri.empty() || !bili::looksLikeBiliUrl(uri)) {
+							emit logReady(QStringLiteral("@我的通知 %1 非视频链接, 跳过: %2")
+								.arg(n.userMid)
+								.arg(contentPreview(QString::fromUtf8(n.uri))));
+							continue;
+						}
+						if (n.userMid <= 0) continue;
+						if (stop_) return;
+
+						// 取视频详情 (view API): 拿到 bvid/标题才认为是真实视频,
+						// 并用规范地址 https://www.bilibili.com/video/<bvid> 入队。
+						bili::VideoInfo vinfo;
+						std::string resolveErr;
+						if (!bili::resolve(uri, vinfo, resolveErr, bili::ProgressFn(), &cancel_)) {
+							if (stop_) return;  // 停用引发的取消不当作失败
+							emit logReady(QStringLiteral("获取 %1 的视频详情失败: %2")
+								.arg(n.userMid)
+								.arg(QString::fromUtf8(resolveErr)));
+							continue;
+						}
+						std::string link;
+						if (!vinfo.bvid.empty()) {
+							link = "https://www.bilibili.com/video/" + vinfo.bvid;
+						}
+						else if (vinfo.aid > 0) {
+							link = "https://www.bilibili.com/video/av" +
+								std::to_string(vinfo.aid);
+						}
+						else {
+							link = uri;  // PGC 等无 bvid/aid 时退回通知里的原始地址
+						}
+
+						enqueue(Job{ n.userMid, link });
+						emit logReady(QStringLiteral("收到 %1 的视频《%2》: %3")
+							.arg(n.userMid)
+							.arg(QString::fromUtf8(vinfo.title))
+							.arg(QString::fromUtf8(link)));
+					}
+				}
+			}
+		}
+	}
+
 	std::vector<bili::PmSession> sessions;
 	std::string err;
 	std::string ackErr;  // 设置已读的错误, 单独存放避免与 err 混用。
@@ -247,24 +409,28 @@ void MessageTab::pollOnce() {
 
 	for (const bili::PmSession& session : sessions) {
 		if (stop_) return;
+		long long begin = 0;
 		const auto it = seqno_.find(session.talkerId);
 		if (it == seqno_.end())
 		{
-			// 只给有未读的会话记基线: 本次不取消息, 刻意跳过已有历史。
-			if (session.unread > 0) {
-				seqno_[session.talkerId] = session.ackSeqno;
-				emit logReady(QStringLiteral("获取 %1 未读消息: %2")
-					.arg(session.talkerId)
-					.arg(session.ackSeqno));
-			}
-			else
-			{
-				continue;
-			}
+			// 首见会话且有未读: 记录已读水位 ack_seqno 当起点, 之后只取消息
+			// seqno 水位以后的部分 = 未读, 历史不会被当成新消息。
+			// (无未读的会话不建条目, 等来新消息再建)
+			if (session.unread <= 0) continue;
+			begin = session.ackSeqno;
+			seqno_[session.talkerId] = begin;  // 注意: 插入可能 rehash, 别再用 it
+			emit logReady(QStringLiteral("会话 %1: 未读 %2 条, 从已读水位续传 ack_seqno=%3")
+				.arg(session.talkerId)
+				.arg(session.unread)
+				.arg(begin));
+		}
+		else
+		{
+			begin = it->second;
 		}
 
 		std::vector<bili::PmMessage> msgs;
-		if (!bili::fetchPmMessages(session.talkerId, it->second, 1, msgs, err)) {
+		if (!bili::fetchPmMessages(session.talkerId, begin, 1, msgs, err)) {
 			emit logReady(QStringLiteral("获取 %1 的私信失败: %2")
 				.arg(session.talkerId)
 				.arg(QString::fromUtf8(err)));

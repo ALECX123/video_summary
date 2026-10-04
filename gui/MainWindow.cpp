@@ -27,6 +27,9 @@ constexpr auto kKeyUname = "session/uname";
 }  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    // Cookie 必须先于 buildUi(): MessageTab 构造时若"启用自动处理"已保存,
+    // 会立刻发首轮轮询请求, 晚一步就会拿到 -101 账号未登录。
+    restoreCredentials();
     buildUi();
     restoreSession();
 
@@ -177,14 +180,17 @@ void MainWindow::onLoginButtonClicked() {
 // 会话 (QSettings) 持久化
 // ---------------------------------------------------------------------------
 
-void MainWindow::restoreSession() {
+void MainWindow::restoreCredentials() {
     QSettings s;
-
     const QString cookie = s.value(kKeyCookie).toString();
-    if (!cookie.isEmpty()) {
-        bili::setCookie(cookie.toStdString());  // 进程级 Cookie, 下载/扫码共用
-        loggedIn_ = true;
-        uname_ = s.value(kKeyUname).toString();
+    if (cookie.isEmpty()) return;
+    bili::setCookie(cookie.toStdString());  // 进程级 Cookie, 下载/扫码共用
+    loggedIn_ = true;
+    uname_ = s.value(kKeyUname).toString();
+}
+
+void MainWindow::restoreSession() {
+    if (loggedIn_) {
         loginPill_->setProperty(("loggedIn"), QStringLiteral("pending"));
         loginPill_->setText(uname_.isEmpty() ? tr("登录状态检查中…")
                                              : tr("已登录: %1").arg(uname_));
@@ -194,6 +200,7 @@ void MainWindow::restoreSession() {
         setLoginState(false, QString());
     }
 
+    QSettings s;
     const QByteArray geo = s.value(kKeyGeometry).toByteArray();
     if (!geo.isEmpty()) restoreGeometry(geo);
 }

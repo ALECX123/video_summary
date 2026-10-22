@@ -30,6 +30,9 @@ QPushButton#btnTopBar {
 }
 QPushButton#btnTopBar:hover { background-color: #26344A; border-color: #0F766E; }
 QPushButton#btnTopBar:pressed { background-color: #0F766E; border-color: #0F766E; color: #FFFFFF; }
+QWidget#userBadge { background: transparent; }
+QLabel#userNameLabel { color: #FFFFFF; font-size: 10pt; font-weight: 600; background: transparent; }
+QLabel#avatarLabel { background: transparent; }
 
 /* ---------------- 标签页 ---------------- */
 QTabWidget::pane {

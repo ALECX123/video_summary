@@ -2465,11 +2465,12 @@ QrPoll qrPoll(const std::string& qrKey, std::string& err)
     }
 }
 
-bool navLoginState(bool& loggedIn, std::string& uname, std::string& err)
+bool navLoginState(bool& loggedIn, std::string& uname, std::string& err, std::string* face)
 {
     loggedIn = false;
     uname.clear();
     err.clear();
+    if (face != nullptr) face->clear();
     try {
         Json root;
         if (!fetchNavRoot(root, err, cookieSnapshot())) return false;
@@ -2503,6 +2504,14 @@ bool navLoginState(bool& loggedIn, std::string& uname, std::string& err)
         if (loggedIn) {
             const Json* u = data->find("uname");
             uname = (u != nullptr) ? u->asString() : std::string();
+            if (face != nullptr) {
+                const Json* f = data->find("face");
+                if (f != nullptr) {
+                    *face = f->asString();
+                    // 站内头像 URL 常以 "//" 开头, 补上 https:。
+                    if (face->rfind("//", 0) == 0) *face = "https:" + *face;
+                }
+            }
         }
         err.clear();
         return true;
@@ -2513,6 +2522,27 @@ bool navLoginState(bool& loggedIn, std::string& uname, std::string& err)
         err = "发生错误: 未知异常";
         return false;
     }
+}
+
+bool fetchAvatar(const std::string& url, std::string& bytes, std::string& err)
+{
+    bytes.clear();
+    err.clear();
+    if (url.empty()) { err = "头像地址为空"; return false; }
+    try {
+        long status = 0;
+        // 图片不是 JSON: requireJsonContentType 必须传 false, 否则 Content-Type 校验会误杀。
+        if (!simpleGet(url, makeBiliHeaders(std::string()), status, bytes, err, false,
+                       nullptr, 5, 15)) {
+            return false;
+        }
+        if (status != 200) { err = "HTTP请求错误: 状态码 " + numberToStr(status); return false; }
+        if (bytes.empty()) { err = "头像内容为空"; return false; }
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("发生错误: ") + ex.what();
+        return false;
+    } catch (...) { err = "发生错误: 未知异常"; return false; }
 }
 
 // ---------------------------------------------------------------------------

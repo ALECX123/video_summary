@@ -97,8 +97,71 @@
          </property>
         </spacer>
        </item>
-       <item>
-        <widget class="QPushButton" name="btnTopBar">
+        <item>
+         <widget class="QCheckBox" name="bootCheck">
+          <property name="text">
+           <string>开机启动</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QWidget" name="userBadge" native="true">
+          <property name="visible">
+           <bool>false</bool>
+          </property>
+          <layout class="QHBoxLayout" name="userBadgeLayout">
+           <property name="spacing">
+            <number>8</number>
+           </property>
+           <property name="leftMargin">
+            <number>0</number>
+           </property>
+           <property name="topMargin">
+            <number>0</number>
+           </property>
+           <property name="rightMargin">
+            <number>0</number>
+           </property>
+           <property name="bottomMargin">
+            <number>0</number>
+           </property>
+           <item>
+            <widget class="QLabel" name="avatarLabel">
+             <property name="minimumSize">
+              <size>
+               <width>28</width>
+               <height>28</height>
+              </size>
+             </property>
+             <property name="maximumSize">
+              <size>
+               <width>28</width>
+               <height>28</height>
+              </size>
+             </property>
+             <property name="visible">
+              <bool>false</bool>
+             </property>
+             <property name="text">
+              <string/>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="userNameLabel">
+             <property name="visible">
+              <bool>false</bool>
+             </property>
+             <property name="text">
+              <string/>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="btnTopBar">
          <property name="cursor">
           <cursorShape>PointingHandCursor</cursorShape>
          </property>

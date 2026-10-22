@@ -58,7 +58,11 @@ QrPoll qrPoll(const std::string& qrKey, std::string& err);
 
 // GET api.bilibili.com/x/web-interface/nav with the current cookie.
 // loggedIn=false with err=="" is NOT an error (anonymous). uname only valid when loggedIn.
-bool navLoginState(bool& loggedIn, std::string& uname, std::string& err);
+// face (optional): filled with data.face (头像 URL) when loggedIn.
+bool navLoginState(bool& loggedIn, std::string& uname, std::string& err, std::string* face = nullptr);
+
+// GET an avatar/image URL (bing/hdslb CDN). bytes = raw image data.
+bool fetchAvatar(const std::string& url, std::string& bytes, std::string& err);
 
 // ---------------- Private messages (私信, message/private_msg.md) ----------------
 // All blocking; call from worker threads; err = UTF-8 Chinese message.
